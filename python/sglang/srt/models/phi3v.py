@@ -2,7 +2,7 @@ from typing import Iterable, List, Literal, Optional, Set, Tuple, TypedDict, Uni
 
 import torch
 import torch.nn as nn
-from transformers import CLIPVisionConfig, Phi3Config, PretrainedConfig
+from transformers import CLIPVisionConfig, PretrainedConfig
 from vllm.model_executor.models.clip import CLIPVisionModel
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -12,6 +12,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.utils import is_list_of
 
+from sglang.srt.configs.phi3v import Phi3VConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -294,7 +295,7 @@ class Phi3VForCausalLM(nn.Module):
     )
 
     def __init__(
-        self, config: Phi3Config, quant_config: Optional[QuantizationConfig] = None
+        self, config: Phi3VConfig, quant_config: Optional[QuantizationConfig] = None
     ):
 
         super().__init__()
