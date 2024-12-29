@@ -420,11 +420,13 @@ class SiglipVisionTransformer(nn.Module):
 
     def forward(
         self,
-        pixel_values: torch.Tensor,
         forward_batch: ForwardBatch,
         interpolate_pos_encoding: bool = True,
         feature_sample_layers: Optional[list[int]] = None,
     ) -> torch.Tensor:
+
+        pixel_values = [i.pixel_values for i in forward_batch.image_inputs]
+        pixel_values = torch.stack(pixel_values, dim=0)
 
         hidden_states = self.embeddings(
             pixel_values,
@@ -453,26 +455,18 @@ class SiglipVisionTransformer(nn.Module):
 
 
 class SiglipVisionModel(nn.Module):
-    config_class = SiglipVisionConfig
-    main_input_name = "pixel_values"
 
     def __init__(
         self,
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        *,
-        num_hidden_layers_override: Optional[int] = None,
-        require_post_norm: Optional[bool] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
 
         self.vision_model = SiglipVisionTransformer(
             config,
             quant_config,
-            num_hidden_layers_override=num_hidden_layers_override,
-            require_post_norm=require_post_norm,
-            prefix=f"{prefix}.vision_model",
+            prefix="vision_model",
         )
 
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -482,16 +476,15 @@ class SiglipVisionModel(nn.Module):
 
     def forward(
         self,
-        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        interpolate_pos_encoding: bool = False,
-        feature_sample_layers: Optional[list[int]] = None,
+        get_embedding: bool = True,
     ) -> torch.Tensor:
 
         hidden_states = self.vision_model(
-            pixel_values=pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-            feature_sample_layers=feature_sample_layers,
+            interpolate_pos_encoding=False,
+            feature_sample_layers=None,
             forward_batch=forward_batch,
         )
 
@@ -539,4 +532,8 @@ class SiglipVisionModel(nn.Module):
         return loaded_params
 
 
-EntryClass = SiglipVisionModel
+class SiglipModel(SiglipVisionModel):
+    pass
+
+
+EntryClass = [SiglipModel, SiglipVisionModel]
