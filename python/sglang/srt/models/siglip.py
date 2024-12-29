@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from transformers import SiglipConfig, SiglipVisionConfig
 
-from sglang.srt.distributed import divide
+from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -229,7 +229,7 @@ class SiglipAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
         self.attn = RadixAttention(
