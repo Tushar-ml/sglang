@@ -6,7 +6,7 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import SiglipVisionConfig
+from transformers import SiglipConfig, SiglipVisionConfig
 
 from sglang.srt.distributed import divide
 from sglang.srt.layers.activation import get_act_fn
@@ -503,13 +503,13 @@ class SiglipVisionModel(nn.Module):
 
     def __init__(
         self,
-        config: SiglipVisionConfig,
+        config: SiglipConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
         self.vision_model = SiglipVisionTransformer(
-            config,
+            config.vision_config,
             quant_config,
             prefix="vision_model",
         )
