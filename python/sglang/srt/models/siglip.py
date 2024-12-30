@@ -503,13 +503,13 @@ class SiglipVisionModel(nn.Module):
 
     def __init__(
         self,
-        config: SiglipConfig,
+        config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
         self.vision_model = SiglipVisionTransformer(
-            config.vision_config,
+            config,
             quant_config,
             prefix="vision_model",
         )
@@ -577,8 +577,4 @@ class SiglipVisionModel(nn.Module):
         return loaded_params
 
 
-class SiglipModel(SiglipVisionModel):
-    pass
-
-
-EntryClass = [SiglipModel, SiglipVisionModel]
+EntryClass = SiglipVisionModel
