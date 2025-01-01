@@ -88,6 +88,14 @@ class ModelConfig:
             self.context_len = derived_context_len
 
         # Unify the config keys for hf_text_config
+        if "Ovis" in self.hf_config.architectures:
+
+            llm_config_dict = self.hf_text_config.llm_config.to_dict()
+            llm_config_dict.pop("architectures")
+            llm_config_dict.pop("_name_or_path")
+
+            self.hf_text_config.update(llm_config_dict)
+
         self.head_dim = getattr(
             self.hf_text_config,
             "head_dim",

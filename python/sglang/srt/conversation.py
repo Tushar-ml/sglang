@@ -366,6 +366,15 @@ def chat_template_exists(template_name: str) -> bool:
     return template_name in chat_templates
 
 
+def remaining_image_token_placeholder(text: str, image_token: str, num_images: str):
+    import re
+
+    matches = re.findall(rf"\b{re.escape(image_token)}\b", text)
+
+    match_found = len(matches)
+    return num_images - match_found
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -539,6 +548,19 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="ovis-llama3",
+        system_message="You are a helpful and honest multimodal assistant.",
+        system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA3,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot_id|>"],
+        image_token="<image>",
     )
 )
 
