@@ -95,6 +95,7 @@ class ModelConfig:
             llm_config_dict.pop("_name_or_path")
 
             self.hf_text_config.update(llm_config_dict)
+            self.hf_text_config.multimodal_max_length = 8192
 
         self.head_dim = getattr(
             self.hf_text_config,

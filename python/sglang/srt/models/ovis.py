@@ -67,7 +67,7 @@ class Ovis(OvisPreTrainedModel):
             config.visual_tokenizer_config.vocab_size,
             config.hidden_size,
             device=torch.device("cuda"),
-            dtype=torch.float16,
+            dtype=self.dtype,
         )
 
     def get_visual_tokenizer(self):
@@ -95,8 +95,6 @@ class Ovis(OvisPreTrainedModel):
                 img for img in forward_batch.image_inputs if img is not None
             ]
 
-        print(image_inputs)
-
         if (
             forward_batch.forward_mode.is_decode()
             or image_inputs is None
@@ -105,11 +103,9 @@ class Ovis(OvisPreTrainedModel):
             inputs_embeds = self.llm.model.embed_tokens(input_ids)
 
         else:
-            _, inputs_embeds, _, _ = self.merge_multimodal(
-                text_input_ids=input_ids,
-                text_attention_masks=positions,
-                text_labels=None,
-                image_inputs=image_inputs,
+
+            _, inputs_embeds, _, _ = self.merge_multimodal_embeddings(
+                input_ids, image_inputs=image_inputs, left_padding=True
             )
 
         return self.llm(
@@ -120,18 +116,17 @@ class Ovis(OvisPreTrainedModel):
         )
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        print(input_ids, image_inputs)
 
-    def merge_multimodal(
+        return input_ids
+
+    def merge_multimodal_embeddings(
         self,
-        text_input_ids: torch.Tensor,
-        text_attention_masks: torch.Tensor,
-        text_labels: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
         image_inputs: Optional[List[ImageInputs]] = None,
         left_padding: bool = False,
     ):
 
-        input_device = text_input_ids.device
+        input_device = input_ids.device
         visual_vocab_szie = self.get_visual_tokenizer().config.vocab_size
         visual_indicator_embeds = self.get_vte()(
             torch.tensor(
@@ -141,125 +136,66 @@ class Ovis(OvisPreTrainedModel):
             )
         ).to(device=input_device)
 
-        pixel_values = [i.pixel_values for i in image_inputs if i is not None]
+        pixel_values = [i.pixel_values for i in image_inputs]
 
         # When inference, sample can include only text with `None` pixel_value
-        num_images = [x.shape[0] if x is not None else 0 for x in pixel_values]
-        if sum(num_images) > 0:
-            visual_tokens = self.visual_tokenizer(
-                torch.cat([x for x in pixel_values if x is not None], dim=0)
-            )
-            visual_embeds = torch.split(
-                self.get_vte()(visual_tokens).to(dtype=self.dtype, device=input_device),
-                split_size_or_sections=num_images,
-                dim=0,
-            )
-            visual_input_ids = torch.split(
-                torch.argmax(visual_tokens, dim=-1).to(device=input_device),
-                split_size_or_sections=num_images,
-                dim=0,
-            )
-            visual_labels = [
-                torch.full(x.shape, IGNORE_ID, dtype=torch.long, device=input_device)
-                for x in visual_input_ids
-            ]
-        else:
-            # just placeholders
-            visual_embeds = [None] * len(num_images)
-            visual_input_ids = [None] * len(num_images)
-            visual_labels = [None] * len(num_images)
+        num_images = len(image_inputs)
+        print("Num Images: ", num_images)
 
-        if text_labels is None:
-            text_labels = torch.full(
-                text_input_ids.shape, IGNORE_ID, dtype=torch.long, device=input_device
-            )
+        visual_tokens = self.visual_tokenizer(
+            torch.cat(pixel_values, dim=0).to(device=input_device)
+        )
+
+        print("Visual Tokens Shape: ", visual_tokens.shape)
+        visual_embeds = self.get_vte()(visual_tokens).to(
+            dtype=self.dtype, device=input_device
+        )
+
+        print("Visual Embeds Shape: ", visual_embeds.shape)
 
         input_embeds = []
-        attention_masks = []
-        labels = []
-        for (
-            text_input_id,
-            text_label,
-            text_attention_mask,
-            visual_embed,
-            visual_input_id,
-            visual_label,
-        ) in zip(
-            text_input_ids,
-            text_labels,
-            text_attention_masks,
-            visual_embeds,
-            visual_input_ids,
-            visual_labels,
-        ):
-            placeholder_token_mask = torch.lt(text_input_id, 0)
-            text_embed = self.get_wte()(
-                torch.masked_fill(text_input_id, placeholder_token_mask, 0)
-            )
-            for i, indicator_id in enumerate(IMAGE_INDICATOR_IDS):
-                text_embed[text_input_id == indicator_id] = visual_indicator_embeds[i]
-            image_atom_positions = torch.where(torch.eq(text_input_id, IMAGE_ATOM_ID))[
-                0
-            ].tolist()
-            if len(image_atom_positions) > 0:
-                input_embed_parts = []
-                attention_mask_parts = []
-                label_parts = []
-                prev_image_atom_position = -1
-                for index, image_atom_position in enumerate(image_atom_positions):
-                    input_embed_parts.append(
-                        text_embed[
-                            prev_image_atom_position + 1 : image_atom_position, :
-                        ]
-                    )
-                    label_parts.append(
-                        text_label[prev_image_atom_position + 1 : image_atom_position]
-                    )
-                    attention_mask_parts.append(
-                        text_attention_mask[
-                            prev_image_atom_position + 1 : image_atom_position
-                        ]
-                    )
-                    input_embed_parts.append(visual_embed[index])
-                    attention_mask_parts.append(
-                        torch.ones_like(visual_label[index], dtype=torch.bool)
-                    )
-                    label_parts.append(visual_label[index])
-                    prev_image_atom_position = image_atom_position
-                if prev_image_atom_position + 1 < text_input_id.shape[0]:
-                    input_embed_parts.append(
-                        text_embed[prev_image_atom_position + 1 :, :]
-                    )
-                    attention_mask_parts.append(
-                        text_attention_mask[prev_image_atom_position + 1 :]
-                    )
-                    label_parts.append(text_label[prev_image_atom_position + 1 :])
-                input_embed = torch.cat(input_embed_parts, dim=0)
-                attention_mask = torch.cat(attention_mask_parts, dim=0)
-                label = torch.cat(label_parts, dim=0)
-            else:
-                input_embed = text_embed
-                attention_mask = text_attention_mask
-                label = text_label
 
-            input_embeds.append(input_embed)
-            attention_masks.append(attention_mask)
-            labels.append(label)
+        placeholder_token_mask = torch.lt(input_ids, 0)
+        print(placeholder_token_mask)
 
-        batch_input_embeds = self.pad_truncate_sequence(
-            input_embeds, batch_first=True, padding_value=0.0, left_padding=left_padding
+        text_embed = self.get_wte()(
+            torch.masked_fill(input_ids, placeholder_token_mask, 0)
         )
-        batch_attention_mask = self.pad_truncate_sequence(
-            attention_masks,
-            batch_first=True,
-            padding_value=False,
-            left_padding=left_padding,
-        )
-        batch_labels = self.pad_truncate_sequence(
-            labels, batch_first=True, padding_value=IGNORE_ID, left_padding=left_padding
-        )
+        print("Before: ", text_embed.shape)
+        for i, indicator_id in enumerate(IMAGE_INDICATOR_IDS):
+            text_embed[input_ids == indicator_id] = visual_indicator_embeds[i]
+        print("After: ", text_embed.shape)
+        image_atom_positions = torch.where(torch.eq(input_ids, IMAGE_ATOM_ID))[
+            0
+        ].tolist()
 
-        return visual_input_ids, batch_input_embeds, batch_labels, batch_attention_mask
+        print(image_atom_positions)
+        if len(image_atom_positions) > 0:
+            input_embed_parts = []
+
+            prev_image_atom_position = -1
+            for index, image_atom_position in enumerate(image_atom_positions):
+                # index = 0, image_atom_position = 27
+                # text_embed shape 38, 3072
+
+                # text_embed[0: 27, :]
+                input_embed_parts.append(
+                    text_embed[prev_image_atom_position + 1 : image_atom_position, :]
+                )
+                input_embed_parts.append(visual_embeds[index])
+
+                prev_image_atom_position = image_atom_position
+            if prev_image_atom_position + 1 < input_ids.shape[0]:
+                input_embed_parts.append(text_embed[prev_image_atom_position + 1 :, :])
+
+            input_embed = torch.cat(input_embed_parts, dim=0)
+
+        else:
+            input_embed = text_embed
+
+        print("Final Input embed shape:", input_embed.shape)
+
+        return None, input_embed, None, None
 
     def pad_truncate_sequence(
         self,
