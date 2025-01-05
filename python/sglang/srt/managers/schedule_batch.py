@@ -148,6 +148,10 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # Ovis related
+    image_atom_positions: List[int] = None
+    num_partitions: int = None
+
     @staticmethod
     def from_dict(obj: dict):
         ret = ImageInputs(
@@ -167,6 +171,9 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_atom_positions",
+            "num_partitions",
+            "num_image_tokens",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -193,6 +200,9 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_atom_positions",
+            "num_partitions",
+            "num_image_tokens",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:

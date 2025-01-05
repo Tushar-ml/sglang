@@ -117,7 +117,40 @@ class Ovis(OvisPreTrainedModel):
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
 
-        return input_ids
+        pad_value = image_inputs.pad_values[0]
+        image_atom_positions = image_inputs.image_atom_positions
+        num_partitions = image_inputs.num_partitions
+        num_image_tokens = image_inputs.num_image_tokens
+
+        input_ids_with_img = []
+        last_atom_position = -1
+
+        print("Initial Input IDS", input_ids)
+
+        offset_list = []
+        for item_position in image_atom_positions:
+            input_ids_with_img.extend(input_ids[last_atom_position + 1 : item_position])
+            pnt1 = len(input_ids_with_img)
+
+            pad_interim = [pad_value for _ in range(num_image_tokens // num_partitions)]
+
+            offset_list.extend([pnt1 - 1, pnt1 + len(pad_interim) - 1])
+            input_ids_with_img += pad_interim
+
+            last_atom_position = item_position
+
+        if last_atom_position + 1 < len(input_ids):
+            input_ids_with_img.extend(input_ids[last_atom_position + 1 :])
+
+        offset_list.insert(0, 0)
+        offset_list.append(len(input_ids_with_img))
+
+        image_inputs.image_offsets = offset_list
+        print("After padding images: ", len(input_ids_with_img), offset_list)
+        import json
+
+        json.dump(input_ids_with_img, open("test.json", "w"))
+        return input_ids_with_img
 
     def merge_multimodal_embeddings(
         self,
@@ -136,8 +169,24 @@ class Ovis(OvisPreTrainedModel):
             )
         ).to(device=input_device)
 
+        print(input_ids)
         pixel_values = [i.pixel_values for i in image_inputs]
+        offset_list = image_inputs[0].image_offsets
 
+        input_ids_interim = input_ids.tolist()
+        input_ids = []
+
+        for idx in range(0, len(offset_list), 2):
+            idx1, idx2 = offset_list[idx], offset_list[idx + 1]
+            print(idx1, idx2)
+            input_ids += input_ids_interim[idx1:idx2] + [-300]
+
+        input_ids += input_ids_interim[idx2:]
+        input_ids = input_ids[:-1]
+        print("Input_IDS after merging: ", input_ids)
+
+        input_ids = torch.tensor(input_ids).to(input_device)
+        print("After clipping: ", input_ids)
         # When inference, sample can include only text with `None` pixel_value
         num_images = len(image_inputs)
         print("Num Images: ", num_images)
@@ -164,10 +213,9 @@ class Ovis(OvisPreTrainedModel):
         print("Before: ", text_embed.shape)
         for i, indicator_id in enumerate(IMAGE_INDICATOR_IDS):
             text_embed[input_ids == indicator_id] = visual_indicator_embeds[i]
+
         print("After: ", text_embed.shape)
-        image_atom_positions = torch.where(torch.eq(input_ids, IMAGE_ATOM_ID))[
-            0
-        ].tolist()
+        image_atom_positions = image_inputs[0].image_atom_positions
 
         print(image_atom_positions)
         if len(image_atom_positions) > 0:
@@ -179,6 +227,7 @@ class Ovis(OvisPreTrainedModel):
                 # text_embed shape 38, 3072
 
                 # text_embed[0: 27, :]
+                print(prev_image_atom_position, image_atom_position)
                 input_embed_parts.append(
                     text_embed[prev_image_atom_position + 1 : image_atom_position, :]
                 )

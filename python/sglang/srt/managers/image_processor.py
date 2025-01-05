@@ -402,6 +402,8 @@ class OvisImagePreprocessor(BaseImageProcessor):
                 self.visual_tokenizer.preprocess_image(image, max_partition=9)
             )
 
+            print("Image Placeholders: ", image_placeholders)
+
             input_ids.extend(image_placeholders)
             pixel_values.append(raw_pixel_values)
 
@@ -409,9 +411,21 @@ class OvisImagePreprocessor(BaseImageProcessor):
 
         # return tensors
         input_ids = torch.tensor(input_ids, dtype=torch.long)
-        pixel_values = torch.cat(pixel_values, dim=0) if len(pixel_values) > 0 else None
+        pixel_values = torch.cat(pixel_values, dim=0)
 
-        input_dict = {"input_ids": input_ids, "pixel_values": pixel_values}
+        visual_tokens = self.visual_tokenizer(pixel_values)
+
+        num_image_tokens = visual_tokens.shape[0] * visual_tokens.shape[1]
+        print("Image tokens length: ", num_image_tokens)
+        image_atom_positions = torch.where(torch.eq(input_ids, -300))[0].tolist()
+
+        input_dict = {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "image_atom_positions": image_atom_positions,
+            "num_image_tokens": num_image_tokens,
+            "num_partitions": visual_tokens.shape[0],
+        }
 
         return input_dict
 

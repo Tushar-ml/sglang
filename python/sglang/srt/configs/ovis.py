@@ -2,6 +2,7 @@ from typing import Optional, Union
 
 import PIL
 import torch
+from torch.nn.functional import gumbel_softmax, pad, softmax
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
