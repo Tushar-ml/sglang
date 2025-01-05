@@ -44,6 +44,7 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
+    GEMMA2 = auto()
 
 
 @dataclasses.dataclass
@@ -153,6 +154,21 @@ class Conversation:
                 else:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
             # print(ret)
+            return ret
+        elif self.sep_style == SeparatorStyle.GEMMA2:
+            ret = "<bos>"
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<start_of_turn>{role}\n"
+                    if i == 0:
+                        if self.system_message:
+                            ret += f"{system_prompt} {message.strip()}<end_of_turn>\n"
+                        else:
+                            ret += f"{message.strip()}<end_of_turn>\n"
+                    else:
+                        ret += f"{message.strip()}<end_of_turn>\n"
+                else:
+                    ret += f"<start_of_turn>{role}\n"
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
@@ -560,6 +576,19 @@ register_conv_template(
         sep_style=SeparatorStyle.LLAMA3,
         sep="",
         stop_str=["<|end_of_text|>", "<|eot_id|>"],
+        image_token="<image>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="ovis-gemma2",
+        system_message="You are a helpful and honest multimodal assistant.",
+        system_template="{system_message}",
+        roles=("user", "model"),
+        sep_style=SeparatorStyle.GEMMA2,
+        sep="",
+        stop_str=["<eos>"],
         image_token="<image>",
     )
 )
