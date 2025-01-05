@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.gemma2 import Gemma2ForCausalLM
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -48,7 +49,10 @@ class Ovis(OvisPreTrainedModel):
 
         super().__init__(config)
 
-        self.llm = LlamaForCausalLM(config.llm_config, quant_config)
+        if "LlamaForCausalLM" in config.llm_config.architectures:
+            self.llm = LlamaForCausalLM(config.llm_config, quant_config)
+        elif "Gemma2ForCausalLM" in config.llm_config.architectures:
+            self.llm = Gemma2ForCausalLM(config.llm_config, quant_config)
         assert config.hidden_size == self.llm.config.hidden_size, "hidden size mismatch"
 
         self.visual_tokenizer = SiglipVisualTokenizer(
@@ -217,7 +221,7 @@ class Ovis(OvisPreTrainedModel):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-
+        llm_weights = []
         for name, loaded_weight in weights:
             if "visual_tokenizer" in name or "vte" in name:
                 param = params_dict[name]
@@ -225,7 +229,9 @@ class Ovis(OvisPreTrainedModel):
                 weight_loader(param, loaded_weight)
             else:
                 name = name.replace("llm.", "")
-                self.llm.load_weights([(name, loaded_weight)])
+                llm_weights.append((name, loaded_weight))
+
+        self.llm.load_weights(llm_weights)
 
 
 EntryClass = Ovis

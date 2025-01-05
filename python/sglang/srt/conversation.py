@@ -588,7 +588,7 @@ register_conv_template(
         roles=("user", "model"),
         sep_style=SeparatorStyle.GEMMA2,
         sep="",
-        stop_str=["<eos>"],
+        stop_str=["<end_of_turn>"],
         image_token="<image>",
     )
 )
