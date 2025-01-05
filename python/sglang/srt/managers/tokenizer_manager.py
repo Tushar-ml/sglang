@@ -279,7 +279,6 @@ class TokenizerManager:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        print(input_ids)
         if obj.input_ids is not None and len(input_ids) >= self.context_len:
             raise ValueError(
                 f"The input ({len(input_ids)} tokens) is longer than the "

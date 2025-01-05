@@ -402,8 +402,6 @@ class OvisImagePreprocessor(BaseImageProcessor):
                 self.visual_tokenizer.preprocess_image(image, max_partition=9)
             )
 
-            print("Image Placeholders: ", image_placeholders)
-
             input_ids.extend(image_placeholders)
             pixel_values.append(raw_pixel_values)
 
@@ -416,7 +414,6 @@ class OvisImagePreprocessor(BaseImageProcessor):
         visual_tokens = self.visual_tokenizer(pixel_values)
 
         num_image_tokens = visual_tokens.shape[0] * visual_tokens.shape[1]
-        print("Image tokens length: ", num_image_tokens)
         image_atom_positions = torch.where(torch.eq(input_ids, -300))[0].tolist()
 
         input_dict = {
@@ -462,7 +459,6 @@ def get_image_processor(
     elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
         return Qwen2VLImageProcessor(hf_config, server_args, processor.image_processor)
     elif "Ovis" in hf_config.architectures:
-        print("Using Ovis in Image Processor")
         return OvisImagePreprocessor(hf_config, server_args)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)

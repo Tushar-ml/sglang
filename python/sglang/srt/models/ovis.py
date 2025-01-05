@@ -1,22 +1,15 @@
 from typing import Iterable, List, Optional, Tuple
 
-import PIL.Image
 import torch
-import torch.nn as nn
 from torch import Tensor
 from torch.nn import init
-from torch.nn.functional import gumbel_softmax, pad, softmax
-from transformers import AutoImageProcessor, AutoModel, PreTrainedModel
+from transformers import PreTrainedModel
 
 from sglang.srt.configs.ovis import (
-    IGNORE_ID,
     IMAGE_ATOM_ID,
     IMAGE_INDICATOR_IDS,
-    IMAGE_TOKEN_ID,
-    BaseVisualTokenizerConfig,
     OvisConfig,
     SiglipVisualTokenizer,
-    SiglipVisualTokenizerConfig,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -105,7 +98,7 @@ class Ovis(OvisPreTrainedModel):
         else:
 
             _, inputs_embeds, _, _ = self.merge_multimodal_embeddings(
-                input_ids, image_inputs=image_inputs, left_padding=True
+                input_ids, image_inputs=image_inputs
             )
 
         return self.llm(
@@ -125,16 +118,9 @@ class Ovis(OvisPreTrainedModel):
         input_ids_with_img = []
         last_atom_position = -1
 
-        print("Initial Input IDS", input_ids)
-
-        offset_list = []
         for item_position in image_atom_positions:
             input_ids_with_img.extend(input_ids[last_atom_position + 1 : item_position])
-            pnt1 = len(input_ids_with_img)
-
             pad_interim = [pad_value for _ in range(num_image_tokens // num_partitions)]
-
-            offset_list.extend([pnt1 - 1, pnt1 + len(pad_interim) - 1])
             input_ids_with_img += pad_interim
 
             last_atom_position = item_position
@@ -142,21 +128,10 @@ class Ovis(OvisPreTrainedModel):
         if last_atom_position + 1 < len(input_ids):
             input_ids_with_img.extend(input_ids[last_atom_position + 1 :])
 
-        offset_list.insert(0, 0)
-        offset_list.append(len(input_ids_with_img))
-
-        image_inputs.image_offsets = offset_list
-        print("After padding images: ", len(input_ids_with_img), offset_list)
-        import json
-
-        json.dump(input_ids_with_img, open("test.json", "w"))
         return input_ids_with_img
 
     def merge_multimodal_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        image_inputs: Optional[List[ImageInputs]] = None,
-        left_padding: bool = False,
+        self, input_ids: torch.Tensor, image_inputs: Optional[List[ImageInputs]] = None
     ):
 
         input_device = input_ids.device
@@ -169,65 +144,61 @@ class Ovis(OvisPreTrainedModel):
             )
         ).to(device=input_device)
 
-        print(input_ids)
         pixel_values = [i.pixel_values for i in image_inputs]
-        offset_list = image_inputs[0].image_offsets
+        pad_value = [i.pad_values for i in image_inputs][0][0]
 
-        input_ids_interim = input_ids.tolist()
-        input_ids = []
+        mask = input_ids == pad_value
+        split_indices = torch.where(mask)[0]
+        chunks = []
 
-        for idx in range(0, len(offset_list), 2):
-            idx1, idx2 = offset_list[idx], offset_list[idx + 1]
-            print(idx1, idx2)
-            input_ids += input_ids_interim[idx1:idx2] + [-300]
+        start = 0
+        for idx in split_indices:
+            if start < idx:
+                chunks.append(input_ids[start:idx])
+            start = idx + 1
 
-        input_ids += input_ids_interim[idx2:]
-        input_ids = input_ids[:-1]
-        print("Input_IDS after merging: ", input_ids)
+        if start < len(input_ids):
+            chunks.append(input_ids[start:])
 
-        input_ids = torch.tensor(input_ids).to(input_device)
-        print("After clipping: ", input_ids)
-        # When inference, sample can include only text with `None` pixel_value
+        separator = torch.tensor([IMAGE_ATOM_ID]).to(device=input_device)
+        if chunks:
+            input_ids = torch.cat([separator] + [chunks[0]]) if mask[0] else chunks[0]
+            for chunk in chunks[1:]:
+                input_ids = torch.cat([input_ids, separator, chunk])
+        else:
+            input_ids = separator
+
         num_images = len(image_inputs)
-        print("Num Images: ", num_images)
 
         visual_tokens = self.visual_tokenizer(
             torch.cat(pixel_values, dim=0).to(device=input_device)
         )
 
-        print("Visual Tokens Shape: ", visual_tokens.shape)
         visual_embeds = self.get_vte()(visual_tokens).to(
             dtype=self.dtype, device=input_device
         )
 
-        print("Visual Embeds Shape: ", visual_embeds.shape)
-
         input_embeds = []
 
         placeholder_token_mask = torch.lt(input_ids, 0)
-        print(placeholder_token_mask)
 
         text_embed = self.get_wte()(
             torch.masked_fill(input_ids, placeholder_token_mask, 0)
         )
-        print("Before: ", text_embed.shape)
+
         for i, indicator_id in enumerate(IMAGE_INDICATOR_IDS):
             text_embed[input_ids == indicator_id] = visual_indicator_embeds[i]
 
-        print("After: ", text_embed.shape)
-        image_atom_positions = image_inputs[0].image_atom_positions
+        image_atom_positions = torch.where(torch.eq(input_ids, IMAGE_ATOM_ID))[
+            0
+        ].tolist()
 
-        print(image_atom_positions)
         if len(image_atom_positions) > 0:
             input_embed_parts = []
 
             prev_image_atom_position = -1
             for index, image_atom_position in enumerate(image_atom_positions):
-                # index = 0, image_atom_position = 27
-                # text_embed shape 38, 3072
 
-                # text_embed[0: 27, :]
-                print(prev_image_atom_position, image_atom_position)
                 input_embed_parts.append(
                     text_embed[prev_image_atom_position + 1 : image_atom_position, :]
                 )
@@ -242,36 +213,12 @@ class Ovis(OvisPreTrainedModel):
         else:
             input_embed = text_embed
 
-        print("Final Input embed shape:", input_embed.shape)
-
         return None, input_embed, None, None
-
-    def pad_truncate_sequence(
-        self,
-        sequences: List[torch.Tensor],
-        batch_first: bool = True,
-        padding_value: float = 0.0,
-        left_padding: bool = False,
-    ) -> torch.Tensor:
-        if left_padding == False:
-            pad_sequence = torch.nn.utils.rnn.pad_sequence(
-                sequences, batch_first=batch_first, padding_value=padding_value
-            )
-            return pad_sequence[:, : self.config.multimodal_max_length]
-        else:
-            pad_sequence = torch.nn.utils.rnn.pad_sequence(
-                [i.flip(dims=[0]) for i in sequences],
-                batch_first=True,
-                padding_value=padding_value,
-            ).flip(dims=[1])
-            return pad_sequence[:, -self.config.multimodal_max_length :]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        # print(params_dict.keys())
 
         for name, loaded_weight in weights:
-            # print(name)
             if "visual_tokenizer" in name or "vte" in name:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
