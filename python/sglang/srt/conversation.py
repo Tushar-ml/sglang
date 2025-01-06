@@ -382,12 +382,10 @@ def chat_template_exists(template_name: str) -> bool:
     return template_name in chat_templates
 
 
-def remaining_image_token_placeholder(text: str, image_token: str, num_images: str):
-    import re
+def remaining_image_token_placeholder(text: str, image_token: str, num_images: int):
 
-    matches = re.findall(rf"\b{re.escape(image_token)}\b", text)
-
-    match_found = len(matches)
+    matches = text.split(image_token)
+    match_found = len(matches) - 1
     return num_images - match_found
 
 
@@ -439,6 +437,8 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
+                        conv.append_image(content.image_url.url)
+
                 if num_image_url > 1:
                     image_token = conv.image_token
                 else:
@@ -447,15 +447,21 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                num_image_placeholder_left = 0
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
                             real_content += "\n"  # for video
                         real_content += content.text
-                    elif content.type == "image_url":
+                        num_image_placeholder_left += remaining_image_token_placeholder(
+                            content.text, conv.image_token, num_image_url
+                        )
+
+                    elif content.type == "image_url" and num_image_placeholder_left > 0:
                         # NOTE: Only works for llava
                         real_content += image_token
-                        conv.append_image(content.image_url.url)
+                        num_image_placeholder_left = num_image_placeholder_left - 1
+
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
