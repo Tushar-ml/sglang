@@ -180,6 +180,7 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -257,11 +258,23 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
+
+
 class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: str
+    name: Optional[str] = None
     parameters: Optional[object] = None
 
 
@@ -275,7 +288,7 @@ class Tool(BaseModel):
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
-    name: str
+    name: Optional[str] = None
 
 
 class ToolChoice(BaseModel):
@@ -297,7 +310,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Optional[ResponseFormat] = None
+    response_format: Union[ResponseFormat, StructuralTagResponseFormat] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -322,13 +335,14 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
 
 
 class FunctionResponse(BaseModel):
     """Function response."""
 
-    name: str
-    arguments: str
+    name: Optional[str] = None
+    arguments: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -365,6 +379,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):

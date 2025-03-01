@@ -18,6 +18,9 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_default_config,
     get_moe_configs,
 )
+from sglang.srt.utils import is_hip
+
+_is_hip_ = is_hip()
 
 
 class BenchmarkConfig(TypedDict):
@@ -38,13 +41,14 @@ def benchmark_config(
     topk: int,
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    if use_int8_w8a16:
+    if use_int8_w8a16 or use_int8_w8a8:
         w1 = torch.randint(
             -127,
             127,
@@ -83,7 +87,7 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 or use_int8_w8a8:
         if block_shape is None:
             w1_scale = torch.randn(num_experts, dtype=torch.float32)
             w2_scale = torch.randn(num_experts, dtype=torch.float32)
@@ -102,8 +106,9 @@ def benchmark_config(
                 (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.float32
             )
 
-        w1 = w1.to(torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fn)
+    if use_fp8_w8a8:
+        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
+        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
@@ -123,6 +128,7 @@ def benchmark_config(
                 renormalize=True,
                 inplace=True,
                 use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
@@ -165,17 +171,15 @@ def benchmark_config(
     return avg
 
 
-def get_configs_compute_bound() -> List[Dict[str, int]]:
-    # Reduced search space for faster tuning.
-    # TODO(woosuk): Increase the search space and use a performance model to
-    # prune the search space.
+def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
     configs: List[BenchmarkConfig] = []
-    for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128, 256]:
-            for block_k in [64, 128, 256]:
-                for block_n in [32, 64, 128, 256]:
-                    for num_warps in [4, 8]:
-                        for group_size in [1, 16, 32, 64]:
+    waves_per_eu_range = 0
+    for num_stages in [2]:
+        for block_m in [32, 64, 128, 256]:
+            for block_k in [32, 64, 128, 256]:
+                for block_n in [16, 32, 64, 128, 256]:
+                    for num_warps in [1, 2, 4, 8]:
+                        for group_size in [1, 4, 8, 16, 32]:
                             configs.append(
                                 {
                                     "BLOCK_SIZE_M": block_m,
@@ -184,8 +188,36 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
                                     "GROUP_SIZE_M": group_size,
                                     "num_warps": num_warps,
                                     "num_stages": num_stages,
+                                    "waves_per_eu": waves_per_eu_range,
                                 }
                             )
+    return configs
+
+
+def get_configs_compute_bound() -> List[Dict[str, int]]:
+    # Reduced search space for faster tuning.
+    # TODO(woosuk): Increase the search space and use a performance model to
+    # prune the search space.
+    configs: List[BenchmarkConfig] = []
+    if _is_hip_:
+        configs = get_rocm_configs_compute_bound()
+    else:
+        for num_stages in [2, 3, 4, 5]:
+            for block_m in [16, 32, 64, 128, 256]:
+                for block_k in [64, 128, 256]:
+                    for block_n in [32, 64, 128, 256]:
+                        for num_warps in [4, 8]:
+                            for group_size in [1, 16, 32, 64]:
+                                configs.append(
+                                    {
+                                        "BLOCK_SIZE_M": block_m,
+                                        "BLOCK_SIZE_N": block_n,
+                                        "BLOCK_SIZE_K": block_k,
+                                        "GROUP_SIZE_M": group_size,
+                                        "num_warps": num_warps,
+                                        "num_stages": num_stages,
+                                    }
+                                )
     return configs
 
 
@@ -206,6 +238,7 @@ class BenchmarkWorker:
         topk: int,
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
+        use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
@@ -228,6 +261,7 @@ class BenchmarkWorker:
                 hidden_size,
                 topk,
                 dtype_str,
+                False,
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
@@ -240,6 +274,7 @@ class BenchmarkWorker:
             topk,
             dtype,
             use_fp8_w8a8,
+            use_int8_w8a8,
             use_int8_w8a16,
             block_shape,
         )
@@ -254,6 +289,7 @@ class BenchmarkWorker:
         topk: int,
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
+        use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
@@ -271,6 +307,7 @@ class BenchmarkWorker:
                     topk,
                     dtype,
                     use_fp8_w8a8,
+                    use_int8_w8a8,
                     use_int8_w8a16,
                     block_shape,
                     num_iters=10,
@@ -296,6 +333,9 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
         "GROUP_SIZE_M": config["GROUP_SIZE_M"],
         "num_warps": config["num_warps"],
         "num_stages": config["num_stages"],
+        **(
+            {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
+        ),
     }
 
 
@@ -307,11 +347,15 @@ def save_configs(
     topk: int,
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     block_shape: List[int],
 ) -> None:
     dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
+        dtype,
+        use_int8_w8a16=use_int8_w8a16,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
@@ -363,6 +407,7 @@ def main(args: argparse.Namespace):
     hidden_size = config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
+    use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     block_shape = None
     if (
@@ -434,6 +479,7 @@ def main(args: argparse.Namespace):
                     topk,
                     dtype,
                     use_fp8_w8a8,
+                    use_int8_w8a8,
                     use_int8_w8a16,
                     block_shape,
                     search_space,
@@ -452,6 +498,7 @@ def main(args: argparse.Namespace):
             topk,
             dtype,
             use_fp8_w8a8,
+            use_int8_w8a8,
             use_int8_w8a16,
             block_shape,
         )
@@ -469,6 +516,7 @@ def main(args: argparse.Namespace):
                     topk,
                     dtype,
                     use_fp8_w8a8,
+                    use_int8_w8a8,
                     use_int8_w8a16,
                     block_shape,
                 )
@@ -488,7 +536,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tp-size", "-tp", type=int, default=2)
     parser.add_argument(
-        "--dtype", type=str, choices=["auto", "fp8_w8a8", "int8_w8a16"], default="auto"
+        "--dtype",
+        type=str,
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
+        default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
