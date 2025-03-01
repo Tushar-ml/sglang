@@ -587,6 +587,19 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="ovis-qwen2",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep_style=SeparatorStyle.CHATML,
+        sep="<|im_end|>",
+        stop_str=["<|endoftext|>", "<|im_end|>"],
+        image_token="<image>"
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="ovis-gemma2",
         system_message="You are a helpful and honest multimodal assistant.",
         system_template="{system_message}",

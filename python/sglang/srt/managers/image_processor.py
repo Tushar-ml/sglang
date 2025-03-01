@@ -574,13 +574,22 @@ class OvisImagePreprocessor(BaseImageProcessor):
         from sglang.srt.configs.ovis import (
             IMAGE_TOKEN,
             IMAGE_TOKEN_ID,
-            SiglipVisualTokenizer,
+            SiglipVisualTokenizer, Aimv2VisualTokenizer
         )
 
-        self.visual_tokenizer = SiglipVisualTokenizer(
-            hf_config.visual_tokenizer_config,
-            image_processor_name_or_path=hf_config.name_or_path,
-        )
+        visual_tokenizer_architecture = hf_config.visual_tokenizer_config.backbone_config.architectures
+        
+        if visual_tokenizer_architecture is not None and visual_tokenizer_architecture[0] == "AIMv2Model":
+            self.visual_tokenizer = Aimv2VisualTokenizer(
+                hf_config.visual_tokenizer_config,
+                image_processor_name_or_path=hf_config.name_or_path,
+            )
+        else:
+            self.visual_tokenizer = SiglipVisualTokenizer(
+                hf_config.visual_tokenizer_config,
+                image_processor_name_or_path=hf_config.name_or_path,
+            )
+
         self.text_tokenizer = AutoTokenizer.from_pretrained(
             server_args.model_path, add_bos_token=False
         )

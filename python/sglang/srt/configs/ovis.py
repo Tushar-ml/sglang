@@ -52,6 +52,16 @@ class BaseVisualTokenizerConfig(PretrainedConfig):
         self.backbone_config = backbone_config
         self.hidden_stride = hidden_stride
 
+class Aimv2VisualTokenizerConfig(BaseVisualTokenizerConfig):
+    model_type = "aimv2_visual_tokenizer"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.drop_cls_token:
+            self.drop_cls_token = False
+        if self.depths:
+            assert len(self.depths) == 1
+            self.backbone_kwargs['num_hidden_layers'] = self.depths[0]
 
 class SiglipVisualTokenizerConfig(BaseVisualTokenizerConfig):
     model_type = "siglip_visual_tokenizer"
@@ -341,10 +351,21 @@ class SiglipVisualTokenizer(BaseVisualTokenizer):
     _image_processor_kwargs = {}
     _backbone_class = SiglipVisionModel
     _backbone_name_or_path = "google/siglip-so400m-patch14-384"
-
+    
     def get_image_size(self):
         height = self.image_processor.size["height"]
         width = self.image_processor.size["width"]
+        return height, width
+    
+class Aimv2VisualTokenizer(BaseVisualTokenizer):
+    config_class = Aimv2VisualTokenizerConfig
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["AIMv2ViTPreprocessor", "AIMv2Block"]
+    _image_processor_kwargs = dict(do_center_crop=False)
+
+    def get_image_size(self):
+        height = self.image_processor.crop_size["height"]
+        width = self.image_processor.crop_size["width"]
         return height, width
 
 

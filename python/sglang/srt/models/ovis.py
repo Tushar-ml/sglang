@@ -9,7 +9,7 @@ from sglang.srt.configs.ovis import (
     IMAGE_ATOM_ID,
     IMAGE_INDICATOR_IDS,
     OvisConfig,
-    SiglipVisualTokenizer,
+    SiglipVisualTokenizer, Aimv2VisualTokenizer
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
 class VisualEmbedding(torch.nn.Embedding):
@@ -53,12 +54,24 @@ class Ovis(OvisPreTrainedModel):
             self.llm = LlamaForCausalLM(config.llm_config, quant_config)
         elif "Gemma2ForCausalLM" in config.llm_config.architectures:
             self.llm = Gemma2ForCausalLM(config.llm_config, quant_config)
+        elif "Qwen2ForCausalLM" in config.llm_config.architectures:
+            self.llm = Qwen2ForCausalLM(config.llm_config, quant_config)
+        else:
+            raise ValueError(f"{config.llm_config.architectures} is not supported")
+        
         assert config.hidden_size == self.llm.config.hidden_size, "hidden size mismatch"
 
-        self.visual_tokenizer = SiglipVisualTokenizer(
-            config.visual_tokenizer_config,
-            image_processor_name_or_path=config.name_or_path,
-        )
+        visual_tokenizer_architecture = config.visual_tokenizer_config.backbone_config.architectures
+        if visual_tokenizer_architecture is not None and visual_tokenizer_architecture[0] == "AIMv2Model":
+            self.visual_tokenizer = Aimv2VisualTokenizer(
+                config.visual_tokenizer_config,
+                image_processor_name_or_path=config.name_or_path,
+            )
+        else:
+            self.visual_tokenizer = SiglipVisualTokenizer(
+                config.visual_tokenizer_config,
+                image_processor_name_or_path=config.name_or_path,
+            )
 
         self.vte = VisualEmbedding(
             config.visual_tokenizer_config.vocab_size,
@@ -175,7 +188,7 @@ class Ovis(OvisPreTrainedModel):
         num_images = len(image_inputs)
 
         visual_tokens = self.visual_tokenizer(
-            torch.cat(pixel_values, dim=0).to(device=input_device)
+            torch.cat(pixel_values, dim=0).to(device=input_device, dtype = self.dtype)
         )
 
         visual_embeds = self.get_vte()(visual_tokens).to(
