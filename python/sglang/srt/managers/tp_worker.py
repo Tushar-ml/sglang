@@ -79,13 +79,24 @@ class TpModelWorker:
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
-                self.tokenizer = self.processor.tokenizer
+                architectures = self.model_config.hf_config.architectures
+                if "Ovis" in architectures:
+                    from transformers import AutoTokenizer
+
+                    self.processor = None
+                    self.tokenizer = get_tokenizer(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                    )
+                else:
+                    self.processor = get_processor(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                    )
+                    self.tokenizer = self.processor.tokenizer
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,

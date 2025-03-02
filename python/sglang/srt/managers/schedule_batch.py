@@ -154,6 +154,9 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # Ovis related
+    image_atom_positions: List[int] = None
+    num_partitions: int = None
     # MiniCPMV related
     # All the images in the batch should share the same special image
     # bound token ids.
@@ -182,6 +185,9 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_atom_positions",
+            "num_partitions",
+            "num_image_tokens",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
@@ -213,6 +219,9 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_atom_positions",
+            "num_partitions",
+            "num_image_tokens",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:

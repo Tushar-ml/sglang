@@ -89,6 +89,15 @@ class ModelConfig:
             self.context_len = derived_context_len
 
         # Unify the config keys for hf_text_config
+        if "Ovis" in self.hf_config.architectures:
+
+            llm_config_dict = self.hf_text_config.llm_config.to_dict()
+            llm_config_dict.pop("architectures")
+            llm_config_dict.pop("_name_or_path")
+
+            self.hf_text_config.update(llm_config_dict)
+            self.hf_text_config.multimodal_max_length = 8192
+
         self.head_dim = getattr(
             self.hf_text_config,
             "head_dim",
@@ -418,6 +427,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaVidForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "Ovis" in model_architectures
         or "Qwen2_5_VLForConditionalGeneration" in model_architectures
         or "MiniCPMV" in model_architectures
     ):

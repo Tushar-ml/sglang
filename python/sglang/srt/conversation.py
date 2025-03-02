@@ -44,6 +44,7 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
+    GEMMA2 = auto()
 
 
 @dataclasses.dataclass
@@ -153,6 +154,21 @@ class Conversation:
                 else:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
             # print(ret)
+            return ret
+        elif self.sep_style == SeparatorStyle.GEMMA2:
+            ret = "<bos>"
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<start_of_turn>{role}\n"
+                    if i == 0:
+                        if self.system_message:
+                            ret += f"{system_prompt} {message.strip()}<end_of_turn>\n"
+                        else:
+                            ret += f"{message.strip()}<end_of_turn>\n"
+                    else:
+                        ret += f"{message.strip()}<end_of_turn>\n"
+                else:
+                    ret += f"<start_of_turn>{role}\n"
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
@@ -366,6 +382,13 @@ def chat_template_exists(template_name: str) -> bool:
     return template_name in chat_templates
 
 
+def remaining_image_token_placeholder(text: str, image_token: str, num_images: int):
+
+    matches = text.split(image_token)
+    match_found = len(matches) - 1
+    return num_images - match_found
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -414,6 +437,8 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
+                        conv.append_image(content.image_url.url)
+
                 if num_image_url > 1:
                     image_token = conv.image_token
                 else:
@@ -422,15 +447,21 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                num_image_placeholder_left = 0
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
                             real_content += "\n"  # for video
                         real_content += content.text
-                    elif content.type == "image_url":
+                        num_image_placeholder_left += remaining_image_token_placeholder(
+                            content.text, conv.image_token, num_image_url
+                        )
+
+                    elif content.type == "image_url" and num_image_placeholder_left > 0:
                         # NOTE: Only works for llava
                         real_content += image_token
-                        conv.append_image(content.image_url.url)
+                        num_image_placeholder_left = num_image_placeholder_left - 1
+
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -538,6 +569,45 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="ovis-llama3",
+        system_message="You are a helpful and honest multimodal assistant.",
+        system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA3,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot_id|>"],
+        image_token="<image>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="ovis-qwen2",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep_style=SeparatorStyle.CHATML,
+        sep="<|im_end|>",
+        stop_str=["<|endoftext|>", "<|im_end|>"],
+        image_token="<image>"
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="ovis-gemma2",
+        system_message="You are a helpful and honest multimodal assistant.",
+        system_template="{system_message}",
+        roles=("user", "model"),
+        sep_style=SeparatorStyle.GEMMA2,
+        sep="",
+        stop_str=["<end_of_turn>"],
+        image_token="<image>",
     )
 )
 

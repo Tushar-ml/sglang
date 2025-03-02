@@ -154,19 +154,29 @@ class TokenizerManager:
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
-                self.tokenizer = self.processor.tokenizer
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                architectures = self.model_config.hf_config.architectures
+                if "Ovis" in architectures:
+                    self.processor = None
+                    self.image_processor = get_image_processor(
+                        self.model_config.hf_config, server_args, self.processor
+                    )
+                    self.tokenizer = self.image_processor.text_tokenizer
+                    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-                # We want to parallelize the image pre-processing so we create an executor for it
-                self.image_processor = get_image_processor(
-                    self.model_config.hf_config, server_args, self.processor
-                )
+                else:
+                    self.processor = get_processor(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                    )
+                    self.tokenizer = self.processor.tokenizer
+                    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+                    # We want to parallelize the image pre-processing so we create an executor for it
+                    self.image_processor = get_image_processor(
+                        self.model_config.hf_config, server_args, self.processor
+                    )
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
