@@ -12,12 +12,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama_embedding import MistralModel
 
 
-class NVEmbedFeatures(TypedDict):
-    input_dict: torch.Tensor
-    attention_mask: torch.Tensor
-    pool_mask: torch.Tensor
-
-
 def exists(val):
     return val is not None
 
@@ -177,7 +171,6 @@ class NVEmbedModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        llm_weights = []
         for name, loaded_weight in weights:
             if "latent_attention_model" in name:
                 param = params_dict[name]
@@ -185,9 +178,7 @@ class NVEmbedModel(nn.Module):
                 weight_loader(param, loaded_weight)
             else:
                 name = name.replace("embedding_model.", "")
-                llm_weights.append((name, loaded_weight))
-
-        self.embedding_model.load_weights(llm_weights)
+                self.embedding_model.load_weights([(name, loaded_weight)])
 
 
 EntryClass = NVEmbedModel
