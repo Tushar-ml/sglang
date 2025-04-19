@@ -12,7 +12,7 @@ from sglang.srt.configs.ovis import (
     SiglipVisualTokenizer, Aimv2VisualTokenizer
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM
@@ -100,9 +100,9 @@ class Ovis(OvisPreTrainedModel):
     ):
 
         image_inputs = None
-        if forward_batch.image_inputs is not None:
+        if forward_batch.mm_inputs is not None:
             image_inputs = [
-                img for img in forward_batch.image_inputs if img is not None
+                img for img in forward_batch.mm_inputs if img is not None
             ]
 
         if (
@@ -125,7 +125,7 @@ class Ovis(OvisPreTrainedModel):
             input_embeds=inputs_embeds,
         )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
 
         pad_value = image_inputs.pad_values[0]
         image_atom_positions = image_inputs.image_atom_positions
@@ -148,10 +148,12 @@ class Ovis(OvisPreTrainedModel):
         return input_ids_with_img
 
     def merge_multimodal_embeddings(
-        self, input_ids: torch.Tensor, image_inputs: Optional[List[ImageInputs]] = None
+        self, input_ids: torch.Tensor, image_inputs: Optional[List[MultimodalInputs]] = None
     ):
 
         input_device = input_ids.device
+        print("input_device: ", input_device)
+
         visual_vocab_szie = self.get_visual_tokenizer().config.vocab_size
         visual_indicator_embeds = self.get_vte()(
             torch.tensor(
