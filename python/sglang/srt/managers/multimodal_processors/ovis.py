@@ -69,7 +69,18 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
         else:
             pixel_values_tensor = torch.empty((0,), dtype=self.dtype)
 
-        visual_tokens = self.visual_tokenizer(pixel_values_tensor)
+        # --- OOM fix: process visual_tokens in mini-batches ---
+        def process_in_batches(tensor, batch_size):
+            outputs = []
+            n = tensor.shape[0]
+            for i in range(0, n, batch_size):
+                outputs.append(self.visual_tokenizer(tensor[i:i+batch_size]))
+            return torch.cat(outputs, dim=0) if outputs else torch.empty((0,), dtype=self.dtype)
+
+        BATCH_SIZE = 2  # Adjust as needed for your GPU
+        visual_tokens = process_in_batches(pixel_values_tensor, BATCH_SIZE)
+        # --- end OOM fix ---
+
         image_atom_positions = torch.where(input_ids_tensor == -300)[0].tolist()
 
         return {

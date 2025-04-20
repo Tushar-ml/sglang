@@ -287,13 +287,28 @@ class BaseVisualTokenizer(PreTrainedModel):
             )
         return tokens
 
-    def encode(self, pixel_values):
+    def encode(self, pixel_values, max_batch_size=1):
         # self.logger.debug("Encode Pixel Values")
-        output = self.get_backbone()(
-            pixel_values, output_hidden_states=True, return_dict=True
-        )
-
-        features = output.hidden_states[-1]
+        n = pixel_values.shape[0]
+        if n <= max_batch_size:
+            output = self.get_backbone()(
+                pixel_values, output_hidden_states=True, return_dict=True
+            )
+            features = output.hidden_states[-1]
+        else:
+            features_list = []
+            for i in range(0, n, max_batch_size):
+                batch = pixel_values[i:i+max_batch_size]
+                output = self.get_backbone()(
+                    batch, output_hidden_states=True, return_dict=True
+                )
+                # Move to CPU to free GPU memory
+                features_list.append(output.hidden_states[-1].cpu())
+                # Optionally, clear CUDA cache to further reduce memory pressure
+                torch.cuda.empty_cache()
+            features = torch.cat(features_list, dim=0)
+            # Move back to CUDA for downstream processing if needed
+            features = features.to(pixel_values.device)
         if self.config.drop_cls_token:
             features = features[:, 1:, :]
 
@@ -329,13 +344,14 @@ class BaseVisualTokenizer(PreTrainedModel):
 
         return features
 
+    @torch.inference_mode()
     def forward(
         self, pixel_values
     ) -> torch.Tensor:  # [BatchSize, ImageShape] -> [BatchSize, #Token, VocabSize]
         # self.logger.debug("Entering Forward function: ")
         pixel_values = pixel_values.to("cuda")
         features = self.encode(pixel_values)
-        #self.logger.debug(f'Features Shape: {features.shape} {features.dtype}')
+        # self.logger.debug(f'Features Shape: {features.shape} {features.dtype}')
         logits = self.head(features)
         #self.logger.debug(f'Logits Shape: {logits.shape}')
         tokens = self.tokenize(logits)
