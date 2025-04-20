@@ -189,6 +189,7 @@ class TokenizerManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast = True
                 )
             else:
                 _processor = get_processor(

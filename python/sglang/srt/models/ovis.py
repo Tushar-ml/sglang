@@ -66,12 +66,14 @@ class Ovis(OvisPreTrainedModel):
             self.visual_tokenizer = Aimv2VisualTokenizer(
                 config.visual_tokenizer_config,
                 image_processor_name_or_path=config.name_or_path,
-            )
+            ).to("cuda")
         else:
             self.visual_tokenizer = SiglipVisualTokenizer(
                 config.visual_tokenizer_config,
                 image_processor_name_or_path=config.name_or_path,
-            )
+            ).to("cuda")
+        
+        
 
         self.vte = VisualEmbedding(
             config.visual_tokenizer_config.vocab_size,
@@ -127,7 +129,8 @@ class Ovis(OvisPreTrainedModel):
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
 
-        pad_value = image_inputs.pad_values[0]
+        
+        pad_value = image_inputs.mm_items[0].pad_value
         image_atom_positions = image_inputs.image_atom_positions
         num_partitions = image_inputs.num_partitions
         num_image_tokens = image_inputs.num_image_tokens
@@ -163,8 +166,8 @@ class Ovis(OvisPreTrainedModel):
             )
         ).to(device=input_device)
 
-        pixel_values = [i.pixel_values for i in image_inputs]
-        pad_value = [i.pad_values for i in image_inputs][0][0]
+        pixel_values = [i.pixel_values for i in image_inputs[0].mm_items]
+        pad_value = image_inputs[0].mm_items[0].pad_value
 
         mask = input_ids == pad_value
         split_indices = torch.where(mask)[0]

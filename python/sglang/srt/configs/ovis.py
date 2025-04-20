@@ -1,5 +1,5 @@
 from typing import Optional, Union
-
+import inspect
 import PIL
 import torch
 from torch.nn.functional import gumbel_softmax, pad, softmax
@@ -19,6 +19,7 @@ IMAGE_TOKEN = "<image>"
 IMAGE_ATOM_ID = -300
 IMAGE_INDICATOR_IDS = [-301, -302, -303, -304, -305]
 
+import logging
 
 class BaseVisualTokenizerConfig(PretrainedConfig):
     def __init__(
@@ -85,10 +86,13 @@ class BaseVisualTokenizer(PreTrainedModel):
 
     def __init__(self, config: BaseVisualTokenizerConfig, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
+        self.logger = logging.getLogger(__name__)
         self.image_processor = AutoImageProcessor.from_pretrained(
             kwargs["image_processor_name_or_path"]
         )
-        self.backbone = AutoModel.from_config(self.config.backbone_config)
+        self.backbone = AutoModel.from_config(self.config.backbone_config).to("cuda")
+
+        self.logger.debug(f'Backbone name: {self.backbone.__class__.__name__}')
         head_dim = self.config.vocab_size - len(
             IMAGE_INDICATOR_IDS
         )  # reserved tokens for IMAGE_INDICATORS
@@ -101,7 +105,7 @@ class BaseVisualTokenizer(PreTrainedModel):
                 bias=False,
             ),
             torch.nn.LayerNorm(head_dim),
-        )
+        ).to("cuda").to(torch.bfloat16)
 
         assert all(
             (
@@ -284,9 +288,11 @@ class BaseVisualTokenizer(PreTrainedModel):
         return tokens
 
     def encode(self, pixel_values):
-        output = self.backbone(
+        self.logger.debug("Encode Pixel Values")
+        output = self.get_backbone()(
             pixel_values, output_hidden_states=True, return_dict=True
         )
+
         features = output.hidden_states[-1]
         if self.config.drop_cls_token:
             features = features[:, 1:, :]
@@ -326,9 +332,15 @@ class BaseVisualTokenizer(PreTrainedModel):
     def forward(
         self, pixel_values
     ) -> torch.Tensor:  # [BatchSize, ImageShape] -> [BatchSize, #Token, VocabSize]
+        self.logger.debug("Entering Forward function: ")
+        pixel_values = pixel_values.to("cuda")
         features = self.encode(pixel_values)
+        self.logger.debug(f'Features Shape: {features.shape} {features.dtype}')
         logits = self.head(features)
+        self.logger.debug(f'Logits Shape: {logits.shape}')
         tokens = self.tokenize(logits)
+        self.logger.debug(f'Tokens Shape: {tokens.shape}')
+
         # tokens' shape is [BatchSize, #Token, VocabSize-5], so padding with [BatchSize, #Token, 5], after
         # which, tokens' shape should become [BatchSize, #Token, VocabSize]
         batch_size, token_len, _ = tokens.shape
