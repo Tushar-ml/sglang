@@ -711,7 +711,7 @@ register_conv_template(
         sep_style=SeparatorStyle.CHATML,
         sep="<|im_end|>",
         stop_str=["<|endoftext|>", "<|im_end|>"],
-        image_token="<image>"
+        image_token="<image>",
     )
 )
 

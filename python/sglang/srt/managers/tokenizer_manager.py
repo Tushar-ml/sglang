@@ -189,7 +189,7 @@ class TokenizerManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
-                    use_fast = True
+                    use_fast=True,
                 )
             else:
                 _processor = get_processor(
@@ -211,7 +211,9 @@ class TokenizerManager:
                 self.tokenizer = self.processor = None
             else:
                 self.processor = _processor
-                self.tokenizer = self.processor.tokenizer if self.processor else tokenizer
+                self.tokenizer = (
+                    self.processor.tokenizer if self.processor else tokenizer
+                )
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
             self.mm_processor = get_dummy_processor()

@@ -8,8 +8,9 @@ from transformers import PreTrainedModel
 from sglang.srt.configs.ovis import (
     IMAGE_ATOM_ID,
     IMAGE_INDICATOR_IDS,
+    Aimv2VisualTokenizer,
     OvisConfig,
-    SiglipVisualTokenizer, Aimv2VisualTokenizer
+    SiglipVisualTokenizer,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalInputs
@@ -58,11 +59,16 @@ class Ovis(OvisPreTrainedModel):
             self.llm = Qwen2ForCausalLM(config.llm_config, quant_config)
         else:
             raise ValueError(f"{llm_arch} is not supported")
-        
+
         assert config.hidden_size == self.llm.config.hidden_size, "hidden size mismatch"
 
-        visual_tokenizer_arch = config.visual_tokenizer_config.backbone_config.architectures
-        if visual_tokenizer_arch is not None and visual_tokenizer_arch[0] == "AIMv2Model":
+        visual_tokenizer_arch = (
+            config.visual_tokenizer_config.backbone_config.architectures
+        )
+        if (
+            visual_tokenizer_arch is not None
+            and visual_tokenizer_arch[0] == "AIMv2Model"
+        ):
             self.visual_tokenizer = Aimv2VisualTokenizer(
                 config.visual_tokenizer_config,
                 image_processor_name_or_path=config.name_or_path,
@@ -141,7 +147,9 @@ class Ovis(OvisPreTrainedModel):
         return input_ids_with_img
 
     def merge_multimodal_embeddings(
-        self, input_ids: torch.Tensor, image_inputs: Optional[List[MultimodalInputs]] = None
+        self,
+        input_ids: torch.Tensor,
+        image_inputs: Optional[List[MultimodalInputs]] = None,
     ):
         input_device = input_ids.device
 
@@ -151,11 +159,15 @@ class Ovis(OvisPreTrainedModel):
         vocab_size = visual_tokenizer.config.vocab_size
 
         # Precompute indicator embeds only once
-        indicator_ids = torch.arange(vocab_size - 5, vocab_size, device=visual_tokenizer.device)
+        indicator_ids = torch.arange(
+            vocab_size - 5, vocab_size, device=visual_tokenizer.device
+        )
         visual_indicator_embeds = vte(indicator_ids).to(device=input_device)
 
         # Efficiently stack all pixel_values at once
-        pixel_values = torch.cat([i.pixel_values for i in image_inputs[0].mm_items], dim=0)
+        pixel_values = torch.cat(
+            [i.pixel_values for i in image_inputs[0].mm_items], dim=0
+        )
         pad_value = image_inputs[0].mm_items[0].pad_value
 
         mask = input_ids == pad_value
@@ -178,11 +190,15 @@ class Ovis(OvisPreTrainedModel):
             input_ids = separator
 
         # Only compute visual tokens once
-        visual_tokens = visual_tokenizer(pixel_values.to(device=input_device, dtype=self.dtype))
+        visual_tokens = visual_tokenizer(
+            pixel_values.to(device=input_device, dtype=self.dtype)
+        )
         visual_embeds = vte(visual_tokens).to(dtype=self.dtype, device=input_device)
 
         placeholder_token_mask = input_ids < 0
-        text_embed = wte(torch.where(placeholder_token_mask, torch.zeros_like(input_ids), input_ids))
+        text_embed = wte(
+            torch.where(placeholder_token_mask, torch.zeros_like(input_ids), input_ids)
+        )
 
         # Use torch.isin for efficient indicator replacement if available, else loop
         for i, indicator_id in enumerate(IMAGE_INDICATOR_IDS):
