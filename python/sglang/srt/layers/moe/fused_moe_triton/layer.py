@@ -27,7 +27,10 @@ else:
 
 import logging
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
+
+if _is_hip:
+    from aiter import ck_moe
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +102,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             layer.w13_weight = torch.nn.Parameter(
                 permute_weight(layer.w13_weight.data),
                 requires_grad=False,
@@ -125,6 +128,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -138,6 +144,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
         )
 
     def forward_cuda(
@@ -153,6 +162,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -166,18 +178,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             correction_bias=correction_bias,
         )
 
-        if is_hip_ and get_bool_env_var("CK_MOE"):
-            import aiter
-            from aiter.fused_moe import fused_experts_ck
-
-            assert activation == "silu", f"{activation=} is not supported."
-
-            return fused_experts_ck(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            assert not no_combine, "unsupported"
+            return ck_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                None,
+                None,
+                None,
+                None,
+                32,
+                None,
+                activation,
             )
         else:
             return fused_experts(
@@ -186,8 +201,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2=layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                inplace=True,
+                inplace=inplace and not no_combine,
                 activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                no_combine=no_combine,
             )
 
     def forward_cpu(
@@ -202,6 +219,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        inplace: bool = True,
     ) -> torch.Tensor:
         return moe_forward_native(
             layer,
@@ -241,6 +259,7 @@ class FusedMoE(torch.nn.Module):
         reduce_results: Whether to all all_reduce on the output of the layer
         renomalize: Whether to renormalize the logits in the fused_moe kernel
         quant_config: Quantization configure.
+        inplace: suggestion to compute inplace (modify input activation).
     """
 
     def __init__(
@@ -261,7 +280,10 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         use_presharded_weights: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
     ):
         super().__init__()
 
@@ -285,6 +307,11 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
         self.activation = activation
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.use_presharded_weights = use_presharded_weights
+        self.inplace = inplace
+        self.no_combine = no_combine
+        self.local_num_experts = num_experts
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -304,7 +331,6 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
-        self.use_presharded_weights = use_presharded_weights
 
     def _load_per_tensor_weight_scale(
         self,
@@ -494,6 +520,10 @@ class FusedMoE(torch.nn.Module):
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
+            # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust input_scale for e4m3fnuz (AMD)
+            if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
+                loaded_weight = loaded_weight * 2.0
+
             # this is needed for compressed-tensors only
             loaded_weight = loaded_weight.to(param.data.device)
 
@@ -532,6 +562,10 @@ class FusedMoE(torch.nn.Module):
             # specific to each case
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust INT4 column-wise scaling number to e4m3fnuz (AMD)
+                if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
+                    loaded_weight = loaded_weight * 0.5
+
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -551,6 +585,10 @@ class FusedMoE(torch.nn.Module):
                     tp_rank=tp_rank,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
+                # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
+                if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
+                    loaded_weight = loaded_weight * 2.0
+
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -598,6 +636,7 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
 
         if self.reduce_results and self.tp_size > 1:

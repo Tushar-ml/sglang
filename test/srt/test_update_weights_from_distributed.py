@@ -15,6 +15,7 @@ distributed setup.
 
 import gc
 import os
+import random
 import time
 import unittest
 
@@ -32,6 +33,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
 )
@@ -522,15 +524,16 @@ def test_update_weights_from_distributed(
     torch.cuda.empty_cache()
 
 
-class TestUpdateWeightsFromDistributed(unittest.TestCase):
+class TestUpdateWeightsFromDistributed(CustomTestCase):
 
     def test_update_weights_from_distributed(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
+            mode = random.choice(["Engine", "Server"])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
             ]
         else:
             test_suits = [

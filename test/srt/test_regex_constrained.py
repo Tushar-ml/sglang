@@ -3,8 +3,6 @@ python3 -m unittest test_regex_constrained.TestRegexConstrained.test_regex_gener
 python3 -m unittest test_regex_constrained.TestRegexConstrained.test_regex_generate_greeting
 python3 -m unittest test_regex_constrained.TestRegexConstrainedLLGuidance.test_regex_generate_email
 python3 -m unittest test_regex_constrained.TestRegexConstrainedLLGuidance.test_regex_generate_greeting
-python3 -m unittest test_regex_constrained.TestJumpForwardLLGuidance.test_regex_generate_email
-python3 -m unittest test_regex_constrained.TestJumpForwardLLGuidance.test_regex_generate_greeting
 """
 
 import json
@@ -17,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -43,11 +42,10 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestRegexConstrained(unittest.TestCase):
+class TestRegexConstrained(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, "xgrammar", disable_overlap=False)
-        cls.check_jump_forward = False
 
     @classmethod
     def tearDownClass(cls):
@@ -177,20 +175,6 @@ class TestRegexConstrained(unittest.TestCase):
             prompt=prompt,
             n=3,
         )
-
-
-class TestJumpForward(TestRegexConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "xgrammar", disable_overlap=True)
-        cls.check_jump_forward = True
-
-
-class TestJumpForwardLLGuidance(TestRegexConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "llguidance", disable_overlap=True)
-        cls.check_jump_forward = True
 
 
 class TestRegexConstrainedLLGuidance(TestRegexConstrained):

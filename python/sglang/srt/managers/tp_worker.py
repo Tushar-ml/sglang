@@ -15,10 +15,13 @@
 
 import logging
 import threading
-from typing import Optional
+from typing import Optional, Tuple
+
+import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -27,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -46,6 +50,8 @@ class TpModelWorker:
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.tp_rank = tp_rank
@@ -62,6 +68,7 @@ class TpModelWorker:
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -74,6 +81,8 @@ class TpModelWorker:
             nccl_port=nccl_port,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -81,13 +90,13 @@ class TpModelWorker:
             if self.model_config.is_multimodal:
                 architectures = self.model_config.hf_config.architectures
                 if "Ovis" in architectures:
-                    from transformers import AutoTokenizer
 
                     self.processor = None
                     self.tokenizer = get_tokenizer(
                         server_args.tokenizer_path,
                         tokenizer_mode=server_args.tokenizer_mode,
                         trust_remote_code=server_args.trust_remote_code,
+                        use_fast = True
                     )
                 else:
                     self.processor = get_processor(
@@ -135,6 +144,9 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
+        # A reference make this class has the same member as TpModelWorkerClient
+        self.worker = self
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -162,7 +174,7 @@ class TpModelWorker:
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
-            self.model_runner.token_to_kv_pool,
+            self.model_runner.token_to_kv_pool_allocator,
         )
 
     def forward_batch_generation(
@@ -170,7 +182,7 @@ class TpModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ):
+    ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
@@ -217,7 +229,7 @@ class TpModelWorker:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors
+                recv_req.serialized_named_tensors[self.tp_rank]
             ),
             load_format=recv_req.load_format,
         )

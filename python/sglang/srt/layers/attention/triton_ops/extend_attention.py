@@ -29,7 +29,7 @@ is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -74,6 +74,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
 ):
@@ -129,6 +130,7 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
+
         offs_kv_loc = tl.load(
             kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
         )
@@ -196,7 +198,11 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
-    cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    cur_block_m_end = (
+        cur_seq_len_extend
+        if not IS_CAUSAL
+        else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    )
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
@@ -243,12 +249,15 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
-        else:
+        elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_causual, qk, float("-inf"))
+        else:
+            mask_non_causal = mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(mask_non_causal, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -299,6 +308,7 @@ def extend_attention_fwd(
     kv_indptr,
     kv_indices,
     custom_mask,
+    is_causal,
     mask_indptr,
     max_len_extend,
     sm_scale=None,
@@ -330,7 +340,7 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if is_hip_:
+    if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
 
@@ -341,12 +351,21 @@ def extend_attention_fwd(
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
-            if Lq <= 128:
-                BLOCK_M, BLOCK_N = (128, 128)
-            elif Lq <= 256:
-                BLOCK_M, BLOCK_N = (64, 64)
+            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
+            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
             else:
-                BLOCK_M, BLOCK_N = (32, 64)
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
         else:
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
@@ -364,7 +383,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip_:
+    if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
@@ -402,8 +421,9 @@ def extend_attention_fwd(
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=is_hip_,
+        STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
