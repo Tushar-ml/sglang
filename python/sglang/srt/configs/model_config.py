@@ -106,7 +106,7 @@ class ModelConfig:
 
             self.hf_text_config.update(llm_config_dict)
             self.hf_text_config.multimodal_max_length = 8192
-        
+
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
@@ -532,7 +532,7 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
-    "Ovis"
+    "Ovis",
 ]
 
 

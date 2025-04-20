@@ -1,11 +1,21 @@
-from sglang.srt.models.ovis import Ovis
-from sglang.srt.managers.multimodal_processors.base_processor import BaseMultimodalProcessor as SGLangBaseProcessor
-from transformers import AutoTokenizer
-from sglang.srt.configs.ovis import IMAGE_TOKEN, IMAGE_TOKEN_ID, SiglipVisualTokenizer, Aimv2VisualTokenizer
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from typing import List, Union
-import torch
 import math
+from typing import List, Union
+
+import torch
+from transformers import AutoTokenizer
+
+from sglang.srt.configs.ovis import (
+    IMAGE_TOKEN,
+    IMAGE_TOKEN_ID,
+    Aimv2VisualTokenizer,
+    SiglipVisualTokenizer,
+)
+from sglang.srt.managers.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.ovis import Ovis
+
 
 class OvisImagePreprocessor(SGLangBaseProcessor):
     models = [Ovis]
@@ -14,13 +24,19 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
         self.hf_config = hf_config
 
         architecture = hf_config.visual_tokenizer_config.backbone_config.architectures
-        tokenizer_cls = Aimv2VisualTokenizer if architecture and architecture[0] == "AIMv2Model" else SiglipVisualTokenizer
+        tokenizer_cls = (
+            Aimv2VisualTokenizer
+            if architecture and architecture[0] == "AIMv2Model"
+            else SiglipVisualTokenizer
+        )
         self.visual_tokenizer = tokenizer_cls(
             hf_config.visual_tokenizer_config,
             image_processor_name_or_path=hf_config.name_or_path,
         )
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(server_args.model_path, add_bos_token=False)
+        self.text_tokenizer = AutoTokenizer.from_pretrained(
+            server_args.model_path, add_bos_token=False
+        )
         self.image_token = IMAGE_TOKEN
         self.image_token_id = IMAGE_TOKEN_ID
         self.dtype = self.visual_tokenizer.dtype
@@ -43,7 +59,9 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
 
     def _process_single_image(self, images: List, input_text: str) -> dict:
         raw_input_ids = self._tokenize_with_image_symbol(input_text)
-        image_token_indices = [i for i, v in enumerate(raw_input_ids) if v == self.image_token_id]
+        image_token_indices = [
+            i for i, v in enumerate(raw_input_ids) if v == self.image_token_id
+        ]
 
         input_ids = []
         pixel_values_list = []
@@ -52,20 +70,24 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
         preprocess_image = self.visual_tokenizer.preprocess_image
 
         for idx, token_idx in enumerate(image_token_indices):
-            input_ids.extend(raw_input_ids[last_index + 1:token_idx])
+            input_ids.extend(raw_input_ids[last_index + 1 : token_idx])
             # Resize the image before preprocessing
             resized_image = self.resize_image(images[idx])
-            raw_pixel_values, placeholders = preprocess_image(resized_image, max_partition=9)
+            raw_pixel_values, placeholders = preprocess_image(
+                resized_image, max_partition=9
+            )
             input_ids.extend(placeholders)
             pixel_values_list.append(raw_pixel_values)
             last_index = token_idx
 
-        input_ids.extend(raw_input_ids[last_index + 1:])
+        input_ids.extend(raw_input_ids[last_index + 1 :])
 
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
         # Only call torch.cat if there are pixel_values
         if pixel_values_list:
-            pixel_values_tensor = torch.cat(pixel_values_list, dim=0).to(dtype=self.dtype)
+            pixel_values_tensor = torch.cat(pixel_values_list, dim=0).to(
+                dtype=self.dtype
+            )
         else:
             pixel_values_tensor = torch.empty((0,), dtype=self.dtype)
 
@@ -74,8 +96,12 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
             outputs = []
             n = tensor.shape[0]
             for i in range(0, n, batch_size):
-                outputs.append(self.visual_tokenizer(tensor[i:i+batch_size]))
-            return torch.cat(outputs, dim=0) if outputs else torch.empty((0,), dtype=self.dtype)
+                outputs.append(self.visual_tokenizer(tensor[i : i + batch_size]))
+            return (
+                torch.cat(outputs, dim=0)
+                if outputs
+                else torch.empty((0,), dtype=self.dtype)
+            )
 
         BATCH_SIZE = 2  # Adjust as needed for your GPU
         visual_tokens = process_in_batches(pixel_values_tensor, BATCH_SIZE)
@@ -85,13 +111,25 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
 
         return {
             "input_ids": input_ids_tensor.tolist(),
-            "mm_items": [MultimodalDataItem(pixel_values=pixel_values_tensor, modality=Modality.IMAGE)],
+            "mm_items": [
+                MultimodalDataItem(
+                    pixel_values=pixel_values_tensor, modality=Modality.IMAGE
+                )
+            ],
             "image_atom_positions": image_atom_positions,
-            "num_image_tokens": visual_tokens.shape[0] * visual_tokens.shape[1] if visual_tokens.numel() > 0 else 0,
-            "num_partitions": visual_tokens.shape[0] if visual_tokens.numel() > 0 else 0,
+            "num_image_tokens": (
+                visual_tokens.shape[0] * visual_tokens.shape[1]
+                if visual_tokens.numel() > 0
+                else 0
+            ),
+            "num_partitions": (
+                visual_tokens.shape[0] if visual_tokens.numel() > 0 else 0
+            ),
         }
 
-    async def process_mm_data_async(self, image_data, input_text, request_obj, max_req_input_len, *args, **kwargs):
+    async def process_mm_data_async(
+        self, image_data, input_text, request_obj, max_req_input_len, *args, **kwargs
+    ):
         if not image_data:
             return None
 
@@ -100,11 +138,18 @@ class OvisImagePreprocessor(SGLangBaseProcessor):
             image_data = [image_data]
 
         # Only decode if input_text is a list of ints
-        if isinstance(input_text, list) and input_text and isinstance(input_text[0], int):
+        if (
+            isinstance(input_text, list)
+            and input_text
+            and isinstance(input_text[0], int)
+        ):
             input_text = self.text_tokenizer.decode(input_text)
 
         # Use list comprehension for loading images
-        images = [self._load_single_item(img, is_video=False, is_audio=False) for img in image_data]
+        images = [
+            self._load_single_item(img, is_video=False, is_audio=False)
+            for img in image_data
+        ]
         image_inputs = self._process_single_image(images, input_text)
 
         return image_inputs

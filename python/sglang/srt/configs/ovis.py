@@ -1,5 +1,6 @@
-from typing import Optional, Union
 import inspect
+from typing import Optional, Union
+
 import PIL
 import torch
 from torch.nn.functional import gumbel_softmax, pad, softmax
@@ -20,6 +21,7 @@ IMAGE_ATOM_ID = -300
 IMAGE_INDICATOR_IDS = [-301, -302, -303, -304, -305]
 
 import logging
+
 
 class BaseVisualTokenizerConfig(PretrainedConfig):
     def __init__(
@@ -53,6 +55,7 @@ class BaseVisualTokenizerConfig(PretrainedConfig):
         self.backbone_config = backbone_config
         self.hidden_stride = hidden_stride
 
+
 class Aimv2VisualTokenizerConfig(BaseVisualTokenizerConfig):
     model_type = "aimv2_visual_tokenizer"
 
@@ -62,7 +65,8 @@ class Aimv2VisualTokenizerConfig(BaseVisualTokenizerConfig):
             self.drop_cls_token = False
         if self.depths:
             assert len(self.depths) == 1
-            self.backbone_kwargs['num_hidden_layers'] = self.depths[0]
+            self.backbone_kwargs["num_hidden_layers"] = self.depths[0]
+
 
 class SiglipVisualTokenizerConfig(BaseVisualTokenizerConfig):
     model_type = "siglip_visual_tokenizer"
@@ -96,16 +100,20 @@ class BaseVisualTokenizer(PreTrainedModel):
         head_dim = self.config.vocab_size - len(
             IMAGE_INDICATOR_IDS
         )  # reserved tokens for IMAGE_INDICATORS
-        self.head = torch.nn.Sequential(
-            torch.nn.Linear(
-                self.backbone.config.hidden_size
-                * self.config.hidden_stride
-                * self.config.hidden_stride,
-                head_dim,
-                bias=False,
-            ),
-            torch.nn.LayerNorm(head_dim),
-        ).to("cuda").to(torch.bfloat16)
+        self.head = (
+            torch.nn.Sequential(
+                torch.nn.Linear(
+                    self.backbone.config.hidden_size
+                    * self.config.hidden_stride
+                    * self.config.hidden_stride,
+                    head_dim,
+                    bias=False,
+                ),
+                torch.nn.LayerNorm(head_dim),
+            )
+            .to("cuda")
+            .to(torch.bfloat16)
+        )
 
         assert all(
             (
@@ -298,7 +306,7 @@ class BaseVisualTokenizer(PreTrainedModel):
         else:
             features_list = []
             for i in range(0, n, max_batch_size):
-                batch = pixel_values[i:i+max_batch_size]
+                batch = pixel_values[i : i + max_batch_size]
                 output = self.get_backbone()(
                     batch, output_hidden_states=True, return_dict=True
                 )
@@ -353,9 +361,9 @@ class BaseVisualTokenizer(PreTrainedModel):
         features = self.encode(pixel_values)
         # self.logger.debug(f'Features Shape: {features.shape} {features.dtype}')
         logits = self.head(features)
-        #self.logger.debug(f'Logits Shape: {logits.shape}')
+        # self.logger.debug(f'Logits Shape: {logits.shape}')
         tokens = self.tokenize(logits)
-        #self.logger.debug(f'Tokens Shape: {tokens.shape}')
+        # self.logger.debug(f'Tokens Shape: {tokens.shape}')
 
         # tokens' shape is [BatchSize, #Token, VocabSize-5], so padding with [BatchSize, #Token, 5], after
         # which, tokens' shape should become [BatchSize, #Token, VocabSize]
@@ -379,12 +387,13 @@ class SiglipVisualTokenizer(BaseVisualTokenizer):
     _image_processor_kwargs = {}
     _backbone_class = SiglipVisionModel
     _backbone_name_or_path = "google/siglip-so400m-patch14-384"
-    
+
     def get_image_size(self):
         height = self.image_processor.size["height"]
         width = self.image_processor.size["width"]
         return height, width
-    
+
+
 class Aimv2VisualTokenizer(BaseVisualTokenizer):
     config_class = Aimv2VisualTokenizerConfig
     supports_gradient_checkpointing = True

@@ -456,7 +456,7 @@ class Scheduler(
                         server_args.tokenizer_path,
                         tokenizer_mode=server_args.tokenizer_mode,
                         trust_remote_code=server_args.trust_remote_code,
-                        use_fast = "True"
+                        use_fast="True",
                     )
                 else:
                     self.processor = get_processor(
