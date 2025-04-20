@@ -92,7 +92,7 @@ class BaseVisualTokenizer(PreTrainedModel):
         )
         self.backbone = AutoModel.from_config(self.config.backbone_config).to("cuda")
 
-        self.logger.debug(f'Backbone name: {self.backbone.__class__.__name__}')
+        # self.logger.debug(f'Backbone name: {self.backbone.__class__.__name__}')
         head_dim = self.config.vocab_size - len(
             IMAGE_INDICATOR_IDS
         )  # reserved tokens for IMAGE_INDICATORS
@@ -288,7 +288,7 @@ class BaseVisualTokenizer(PreTrainedModel):
         return tokens
 
     def encode(self, pixel_values):
-        self.logger.debug("Encode Pixel Values")
+        # self.logger.debug("Encode Pixel Values")
         output = self.get_backbone()(
             pixel_values, output_hidden_states=True, return_dict=True
         )
@@ -332,14 +332,14 @@ class BaseVisualTokenizer(PreTrainedModel):
     def forward(
         self, pixel_values
     ) -> torch.Tensor:  # [BatchSize, ImageShape] -> [BatchSize, #Token, VocabSize]
-        self.logger.debug("Entering Forward function: ")
+        # self.logger.debug("Entering Forward function: ")
         pixel_values = pixel_values.to("cuda")
         features = self.encode(pixel_values)
-        self.logger.debug(f'Features Shape: {features.shape} {features.dtype}')
+        #self.logger.debug(f'Features Shape: {features.shape} {features.dtype}')
         logits = self.head(features)
-        self.logger.debug(f'Logits Shape: {logits.shape}')
+        #self.logger.debug(f'Logits Shape: {logits.shape}')
         tokens = self.tokenize(logits)
-        self.logger.debug(f'Tokens Shape: {tokens.shape}')
+        #self.logger.debug(f'Tokens Shape: {tokens.shape}')
 
         # tokens' shape is [BatchSize, #Token, VocabSize-5], so padding with [BatchSize, #Token, 5], after
         # which, tokens' shape should become [BatchSize, #Token, VocabSize]

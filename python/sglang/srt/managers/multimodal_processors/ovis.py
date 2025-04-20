@@ -1,14 +1,7 @@
 from sglang.srt.models.ovis import Ovis
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
+from sglang.srt.managers.multimodal_processors.base_processor import BaseMultimodalProcessor as SGLangBaseProcessor
 from transformers import AutoTokenizer
-from sglang.srt.configs.ovis import (
-    IMAGE_TOKEN,
-    IMAGE_TOKEN_ID,
-    SiglipVisualTokenizer, Aimv2VisualTokenizer
-)
-
+from sglang.srt.configs.ovis import IMAGE_TOKEN, IMAGE_TOKEN_ID, SiglipVisualTokenizer, Aimv2VisualTokenizer
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from typing import List, Union
 import torch
@@ -16,136 +9,136 @@ import logging
 
 class OvisImagePreprocessor(SGLangBaseProcessor):
     models = [Ovis]
+
     def __init__(self, hf_config, server_args, *args, **kwargs):
-        self.logger = logging.getLogger(__name__)
+        self.hf_config = hf_config
 
-        visual_tokenizer_architecture = hf_config.visual_tokenizer_config.backbone_config.architectures
-
-        if visual_tokenizer_architecture is not None and visual_tokenizer_architecture[0] == "AIMv2Model":
-            self.visual_tokenizer = Aimv2VisualTokenizer(
-                hf_config.visual_tokenizer_config,
-                image_processor_name_or_path=hf_config.name_or_path,
-            )
-        else:
-            self.visual_tokenizer = SiglipVisualTokenizer(
-                hf_config.visual_tokenizer_config,
-                image_processor_name_or_path=hf_config.name_or_path,
-            )
-
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            server_args.model_path, add_bos_token=False
+        architecture = hf_config.visual_tokenizer_config.backbone_config.architectures
+        tokenizer_cls = Aimv2VisualTokenizer if architecture and architecture[0] == "AIMv2Model" else SiglipVisualTokenizer
+        self.visual_tokenizer = tokenizer_cls(
+            hf_config.visual_tokenizer_config,
+            image_processor_name_or_path=hf_config.name_or_path,
         )
+
+        self.text_tokenizer = AutoTokenizer.from_pretrained(server_args.model_path, add_bos_token=False)
         self.image_token = IMAGE_TOKEN
         self.image_token_id = IMAGE_TOKEN_ID
-        self.hf_config = hf_config
         self.dtype = self.visual_tokenizer.dtype
+        self.IMAGE_FACTOR = 28
+        self.MIN_PIXELS = 4 * 28 * 28
+        self.MAX_PIXELS = 16384 * 28 * 28
+        self.MAX_RATIO = 200
 
-
-    def _tokenize_with_image_symbol(self, text):
-        self.logger.debug(f"Tokenizing text with image symbols: {text}")
-        text_chunks = [
-            self.text_tokenizer(chunk, add_special_tokens=False).input_ids
-            for chunk in text.split(self.image_token)
-        ]
+    def _tokenize_with_image_symbol(self, text: str) -> List[int]:
+        # Efficiently tokenize text with image symbols
+        text_chunks = text.split(self.image_token)
         token_ids = []
-        num_chuck = len(text_chunks)
-        self.logger.debug(f"Split into {num_chuck} text chunks around image tokens")
-        
+        append = token_ids.append
+        extend = token_ids.extend
         for i, chunk in enumerate(text_chunks):
-            token_ids.extend(chunk)
-            if i < num_chuck - 1:
-                token_ids.append(self.image_token_id)
-        self.logger.debug(f"Tokenized text with image symbols: {token_ids}")
-        self.logger.debug(f"Final token IDs length: {len(token_ids)}")
+            extend(self.text_tokenizer(chunk, add_special_tokens=False).input_ids)
+            if i < len(text_chunks) - 1:
+                append(self.image_token_id)
         return token_ids
 
-    def _process_single_image(self, images, input_text):
-        self.logger.debug(f"Processing single image with input text: {input_text}")
+    def _process_single_image(self, images: List, input_text: str) -> dict:
         raw_input_ids = self._tokenize_with_image_symbol(input_text)
+        image_token_indices = [i for i, v in enumerate(raw_input_ids) if v == self.image_token_id]
 
         input_ids = []
-        pixel_values = []
+        pixel_values_list = []
+        last_index = -1
 
-        image_token_indices = [
-            i for i, v in enumerate(raw_input_ids) if v == self.image_token_id
-        ]
-        self.logger.debug(f"Image token indices: {image_token_indices}")
-        last_image_token_index = -1
-        
-        print(self.logger.debug(f"Processing {len(image_token_indices)} image tokens"))
-        for i in range(len(image_token_indices)):
-            self.logger.debug(f"Processing image token index: {i}")
-            head = 0 if i == 0 else image_token_indices[i - 1] + 1
-            tail = image_token_indices[i]
-            last_image_token_index = tail
-            input_ids.extend(raw_input_ids[head:tail])
+        preprocess_image = self.visual_tokenizer.preprocess_image
 
-            image = images[i]
-            raw_pixel_values, image_placeholders = (
-                self.visual_tokenizer.preprocess_image(image, max_partition=9)
-            )
+        for idx, token_idx in enumerate(image_token_indices):
+            input_ids.extend(raw_input_ids[last_index + 1:token_idx])
+            # Resize the image before preprocessing
+            resized_image = self.resize_image(images[idx])
+            raw_pixel_values, placeholders = preprocess_image(resized_image, max_partition=9)
+            input_ids.extend(placeholders)
+            pixel_values_list.append(raw_pixel_values)
+            last_index = token_idx
 
-            self.logger.debug(f"Image preprocessed - pixel values shape: {raw_pixel_values.shape}")
+        input_ids.extend(raw_input_ids[last_index + 1:])
 
-            input_ids.extend(image_placeholders)
-            pixel_values.append(raw_pixel_values)
-            self.logger.debug(f"Image preprocessed - pixel values shape after concat: {pixel_values[-1].shape}")
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+        # Only call torch.cat if there are pixel_values
+        if pixel_values_list:
+            pixel_values_tensor = torch.cat(pixel_values_list, dim=0).to(dtype=self.dtype)
+        else:
+            pixel_values_tensor = torch.empty((0,), dtype=self.dtype)
 
-        self.logger.debug(f"Processing last image token index: {last_image_token_index}")
-        input_ids.extend(raw_input_ids[last_image_token_index + 1 :])
-        self.logger.debug(f"Final input IDs length: {len(input_ids)}")
-        # return tensors
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
-        pixel_values = torch.cat(pixel_values, dim=0).to(self.dtype)
+        visual_tokens = self.visual_tokenizer(pixel_values_tensor)
+        image_atom_positions = torch.where(input_ids_tensor == -300)[0].tolist()
 
-        self.logger.debug(f"Pixel values shape after concat: {pixel_values.shape}")
-        self.logger.debug(f"Pixel values dtype: {pixel_values.dtype}")
-        
-        visual_tokens = self.visual_tokenizer(pixel_values)
-        self.logger.debug(f"Visual tokens shape: {visual_tokens.shape}")
-
-        num_image_tokens = visual_tokens.shape[0] * visual_tokens.shape[1]
-        image_atom_positions = torch.where(torch.eq(input_ids, -300))[0].tolist()
-        
-        items = [
-            MultimodalDataItem(
-                pixel_values=pixel_values,
-                modality=Modality.IMAGE,
-            )
-        ]
-        input_dict = {
-            "input_ids": input_ids,
-            "mm_items": items,
+        return {
+            "input_ids": input_ids_tensor.tolist(),
+            "mm_items": [MultimodalDataItem(pixel_values=pixel_values_tensor, modality=Modality.IMAGE)],
             "image_atom_positions": image_atom_positions,
-            "num_image_tokens": num_image_tokens,
-            "num_partitions": visual_tokens.shape[0],
+            "num_image_tokens": visual_tokens.shape[0] * visual_tokens.shape[1] if visual_tokens.numel() > 0 else 0,
+            "num_partitions": visual_tokens.shape[0] if visual_tokens.numel() > 0 else 0,
         }
 
-        self.logger.debug(f"Processed image inputs - num tokens: {len(input_ids)}, "
-                         f"num image tokens: {num_image_tokens}")
-        return input_dict
-    
     async def process_mm_data_async(self, image_data, input_text, request_obj, max_req_input_len, *args, **kwargs):
-        self.logger.debug(f"Processing multimodal data - images: {len(image_data) if image_data else 0}, "
-                        f"input text type: {type(input_text)}")
         if not image_data:
             return None
 
+        # Avoid unnecessary list conversion if already a list
         if not isinstance(image_data, list):
             image_data = [image_data]
 
-        if isinstance(input_text, list):
-            assert len(input_text) and isinstance(input_text[0], int)
+        # Only decode if input_text is a list of ints
+        if isinstance(input_text, list) and input_text and isinstance(input_text[0], int):
             input_text = self.text_tokenizer.decode(input_text)
 
-        if len(image_data) > 0:
-            images = [self._load_single_item(image, False, False) for image in image_data]
-        else:
-            images = self._load_single_item(image_data[0], False, False)
-
+        # Use list comprehension for loading images
+        images = [self._load_single_item(img, is_video=False, is_audio=False) for img in image_data]
         image_inputs = self._process_single_image(images, input_text)
-        image_inputs["image_hashes"] = [hash(str(image_data))]
-        image_inputs["input_ids"] = image_inputs["input_ids"].tolist()
 
-        self.logger.debug(f"Final image inputs prepared with hash: {image_inputs['image_hashes'][0]}")
         return image_inputs
+
+    def smart_resize(
+        self,
+        height: int,
+        width: int,
+        factor: int = 28,
+        min_pixels: int = 4 * 28 * 28,
+        max_pixels: int = 16384 * 28 * 28,
+    ) -> tuple[int, int]:
+        if max(height, width) / min(height, width) > self.MAX_RATIO:
+            raise ValueError(
+                f"absolute aspect ratio must be smaller than {self.MAX_RATIO}, got {max(height, width) / min(height, width)}"
+            )
+        h_bar = max(factor, self.round_by_factor(height, factor))
+        w_bar = max(factor, self.round_by_factor(width, factor))
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = self.floor_by_factor(height / beta, factor)
+            w_bar = self.floor_by_factor(width / beta, factor)
+        elif h_bar * w_bar < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            h_bar = self.ceil_by_factor(height * beta, factor)
+            w_bar = self.ceil_by_factor(width * beta, factor)
+        return h_bar, w_bar
+
+    def round_by_factor(self, number: int, factor: int) -> int:
+        return round(number / factor) * factor
+
+    def ceil_by_factor(self, number: int, factor: int) -> int:
+        return math.ceil(number / factor) * factor
+
+    def floor_by_factor(self, number: int, factor: int) -> int:
+        return math.floor(number / factor) * factor
+
+    def resize_image(self, image, size_factor: int = 28):
+        width, height = image.size
+        resized_height, resized_width = self.smart_resize(
+            height,
+            width,
+            factor=size_factor,
+            min_pixels=self.MIN_PIXELS,
+            max_pixels=self.MAX_PIXELS,
+        )
+        image = image.resize((resized_width, resized_height))
+        return image
