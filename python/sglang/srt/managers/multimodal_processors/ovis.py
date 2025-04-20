@@ -5,7 +5,7 @@ from sglang.srt.configs.ovis import IMAGE_TOKEN, IMAGE_TOKEN_ID, SiglipVisualTok
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from typing import List, Union
 import torch
-import logging
+import math
 
 class OvisImagePreprocessor(SGLangBaseProcessor):
     models = [Ovis]
