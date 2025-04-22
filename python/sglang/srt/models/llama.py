@@ -291,6 +291,15 @@ class LlamaModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
+    
+    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.config, "scale_emb"):
+            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
+        else:
+            return self.get_input_embeddings()(input_ids)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
 
     def forward(
         self,
