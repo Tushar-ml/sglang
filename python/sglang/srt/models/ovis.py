@@ -13,7 +13,8 @@ from sglang.srt.configs.ovis import (
     SiglipVisualTokenizer,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM
@@ -98,32 +99,37 @@ class Ovis(OvisPreTrainedModel):
     def get_wte(self):
         return self.llm.model.embed_tokens
 
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+
+        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).to(
+            dtype=self.dtype, device="cuda"
+        )
+
+        visual_tokens = self.get_visual_tokenizer()(
+            pixel_values.to(device="cuda", dtype=self.dtype)
+        )
+        visual_embeds = self.get_vte()(visual_tokens).to(
+            dtype=self.dtype, device="cuda"
+        )
+        return visual_embeds
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        # Avoid unnecessary list comprehension if mm_inputs is None or empty
-        mm_inputs = forward_batch.mm_inputs
-        if (
-            forward_batch.forward_mode.is_decode()
-            or mm_inputs is None
-            or not any(mm_inputs)
-        ):
-            inputs_embeds = self.llm.model.embed_tokens(input_ids)
-        else:
-            # Only filter non-None if needed
-            image_inputs = [img for img in mm_inputs if img is not None]
-            _, inputs_embeds, _, _ = self.merge_multimodal_embeddings(
-                input_ids, image_inputs=image_inputs
-            )
 
-        return self.llm(
-            input_ids,
-            positions,
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
+            language_model=self.llm.model,
+            image_data_embedding_func=self.get_image_feature,
+            positions=positions,
+        )
+
+        return self.llm.logits_processor(
+            input_ids, hidden_states, self.llm.lm_head, forward_batch
         )
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
@@ -145,85 +151,6 @@ class Ovis(OvisPreTrainedModel):
             input_ids_with_img.extend(input_ids[last_atom_position + 1 :])
 
         return input_ids_with_img
-
-    def merge_multimodal_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        image_inputs: Optional[List[MultimodalInputs]] = None,
-    ):
-        input_device = input_ids.device
-
-        visual_tokenizer = self.get_visual_tokenizer()
-        vte = self.get_vte()
-        wte = self.get_wte()
-        vocab_size = visual_tokenizer.config.vocab_size
-
-        # Precompute indicator embeds only once
-        indicator_ids = torch.arange(
-            vocab_size - 5, vocab_size, device=visual_tokenizer.device
-        )
-        visual_indicator_embeds = vte(indicator_ids).to(device=input_device)
-
-        # Efficiently stack all pixel_values at once
-        pixel_values = torch.cat(
-            [i.pixel_values for i in image_inputs[0].mm_items], dim=0
-        )
-        pad_value = image_inputs[0].mm_items[0].pad_value
-
-        mask = input_ids == pad_value
-        split_indices = torch.where(mask)[0]
-        chunks = []
-        start = 0
-        for idx in split_indices:
-            if start < idx:
-                chunks.append(input_ids[start:idx])
-            start = idx + 1
-        if start < len(input_ids):
-            chunks.append(input_ids[start:])
-
-        separator = torch.tensor([IMAGE_ATOM_ID], device=input_device)
-        if chunks:
-            input_ids = torch.cat([separator, chunks[0]]) if mask[0] else chunks[0]
-            for chunk in chunks[1:]:
-                input_ids = torch.cat([input_ids, separator, chunk])
-        else:
-            input_ids = separator
-
-        # Only compute visual tokens once
-        visual_tokens = visual_tokenizer(
-            pixel_values.to(device=input_device, dtype=self.dtype)
-        )
-        visual_embeds = vte(visual_tokens).to(dtype=self.dtype, device=input_device)
-
-        placeholder_token_mask = input_ids < 0
-        text_embed = wte(
-            torch.where(placeholder_token_mask, torch.zeros_like(input_ids), input_ids)
-        )
-
-        # Use torch.isin for efficient indicator replacement if available, else loop
-        for i, indicator_id in enumerate(IMAGE_INDICATOR_IDS):
-            mask = input_ids == indicator_id
-            if mask.any():
-                text_embed[mask] = visual_indicator_embeds[i]
-
-        image_atom_positions = torch.where(input_ids == IMAGE_ATOM_ID)[0].tolist()
-
-        if image_atom_positions:
-            input_embed_parts = []
-            prev_image_atom_position = -1
-            for index, image_atom_position in enumerate(image_atom_positions):
-                input_embed_parts.append(
-                    text_embed[prev_image_atom_position + 1 : image_atom_position, :]
-                )
-                input_embed_parts.append(visual_embeds[index])
-                prev_image_atom_position = image_atom_position
-            if prev_image_atom_position + 1 < input_ids.shape[0]:
-                input_embed_parts.append(text_embed[prev_image_atom_position + 1 :, :])
-            input_embed = torch.cat(input_embed_parts, dim=0)
-        else:
-            input_embed = text_embed
-
-        return None, input_embed, None, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
