@@ -531,11 +531,19 @@ def generate_chat_conv(
                 real_content = ""
                 # calculate number of image_url
                 num_image_url = 0
+                text_content = ""
                 for content in message.content:
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
                         conv.append_image(content.image_url.url)
+                    elif content.type == "text":
+                        text_content += content.text
+
+                # Process text content first to get placeholder count
+                num_image_placeholder_left = remaining_image_token_placeholder(
+                    text_content, conv.image_token, num_image_url
+                )
 
                 if num_image_url > 1:
                     image_token = conv.image_token
@@ -545,25 +553,19 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
-                num_image_placeholder_left = 0
-                audio_token = conv.audio_token
+
+                # Now process all content in order
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
                             real_content += "\n"  # for video
                         real_content += content.text
-                        num_image_placeholder_left += remaining_image_token_placeholder(
-                            content.text, conv.image_token, num_image_url
-                        )
-
-                    elif content.type == "image_url" and num_image_placeholder_left > 0:
-                        # NOTE: Only works for llava
-                        real_content += image_token
-                        num_image_placeholder_left = num_image_placeholder_left - 1
-
-                        conv.append_image(content.image_url.url)
+                    elif content.type == "image_url":
+                        if num_image_placeholder_left > 0:
+                            real_content += image_token
+                            num_image_placeholder_left -= 1
                     elif content.type == "audio_url":
-                        real_content += audio_token
+                        real_content += conv.audio_token
                         conv.append_audio(content.audio_url.url)
 
                 conv.append_message(conv.roles[0], real_content)
