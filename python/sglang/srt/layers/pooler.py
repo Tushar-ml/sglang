@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
+import torch.nn.functional as F
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.model_runner import ForwardBatch
@@ -16,6 +17,7 @@ from sglang.srt.model_executor.model_runner import ForwardBatch
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    STEP = 2
 
 
 @dataclass
@@ -58,6 +60,49 @@ class Pooler(nn.Module):
 
         return EmbeddingPoolerOutput(embeddings=pooled_data)
 
+class StepPooler(Pooler):
+    def __init__(
+        self,
+        *,
+        normalize: bool,
+        softmax: bool,
+        step_tag_id: Optional[int] = None,
+        returned_token_ids: Optional[list[int]] = None,
+    ):
+        super().__init__(PoolingType.STEP, normalize)
+        
+        self.step_tag_id = step_tag_id
+        self.returned_token_ids = returned_token_ids
+        self.softmax = softmax
+
+    def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> EmbeddingPoolerOutput:
+
+        prompt_lens = forward_batch.extend_seq_lens
+        prompt_token_ids = forward_batch.input_ids
+
+        offset = 0
+        pooled_data = []
+        for prompt_len in prompt_lens:
+            hidden_states_i = hidden_states[offset : offset + prompt_len]
+            probabilities_i = F.softmax(hidden_states_i, dim=-1)
+            token_masks_i = prompt_token_ids[offset : offset + prompt_len] == self.step_tag_id
+            probabilities_i = probabilities_i * token_masks_i.unsqueeze(-1)
+
+            positive_probs = probabilities_i[probabilities_i != 0].view(-1, 2)[:, 1]
+            if positive_probs.size(0) != 0:
+                pooled_data.append(positive_probs.cpu())
+
+            offset += prompt_len
+
+        if len(pooled_data) != 0:
+            pooled_data = torch.stack(pooled_data).view(1, -1)
+        else:
+            pooled_data = torch.Tensor([[]])
+
+        print(pooled_data)
+        
+        return EmbeddingPoolerOutput(embeddings=pooled_data)
+        
 
 class CrossEncodingPooler(nn.Module):
     """A layer that pools specific information from hidden states.

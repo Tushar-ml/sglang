@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType, StepPooler
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
@@ -61,6 +61,7 @@ class Qwen2ForRewardModel(nn.Module):
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits = self.score(hidden_states)
+        print("Logits shape: ", logits.shape)
         pooled_logits = self.pooler(logits, forward_batch).embeddings
 
         return EmbeddingPoolerOutput(pooled_logits)
@@ -72,7 +73,29 @@ class Qwen2ForRewardModel(nn.Module):
         ]
         return Qwen2ForCausalLM.load_weights(self, filtered_weights)
 
+class Qwen2ForProcessRewardModel(Qwen2ForRewardModel):
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, quant_config, prefix)
+        self.num_labels = 2
+        self.score = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, self.num_labels),
+        )
+        self.pooler = StepPooler(
+            normalize=False,
+            softmax=True,
+            step_tag_id=151651
+        )
+
+        
 
 EntryClass = [
-    Qwen2ForRewardModel,
+    Qwen2ForRewardModel, Qwen2ForProcessRewardModel
 ]
