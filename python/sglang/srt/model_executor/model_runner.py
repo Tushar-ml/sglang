@@ -1245,6 +1245,12 @@ class ModelRunner:
 
             logger.info(f"Intel AMX attention backend is enabled.")
             return IntelAMXAttnBackend(self)
+        elif self.server_args.attention_backend == "sageattn":
+            from sglang.srt.layers.attention.sageattention_backend import (
+                SageAttentionBackend,
+            )
+
+            return SageAttentionBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"

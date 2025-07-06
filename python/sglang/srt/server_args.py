@@ -1107,6 +1107,7 @@ class ServerArgs:
                 "intel_amx",
                 "torch_native",
                 "triton",
+                "sageattn",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
