@@ -409,6 +409,7 @@ async def health() -> Response:
     """
     return Response(status_code=200)
 
+
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
