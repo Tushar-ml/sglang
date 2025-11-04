@@ -2,74 +2,106 @@
 
 [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang
 
+<div align="center">
+
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/sgl-project/sglang/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
+</div>
+
+SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernels for operations.
+
 ## Installation
-
-For CUDA 11.8:
-
-```bash
-pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
-```
-
-For CUDA 12.1 or CUDA 12.4:
+Requires torch == 2.8.0
 
 ```bash
-pip3 install sgl-kernel
+# Latest version
+pip3 install sgl-kernel --upgrade
 ```
 
-# Developer Guide
+## Building from Source
+Requires
+- CMake ≥3.31,
+- Python ≥3.10
+- scikit-build-core
+- ninja(optional)
 
-## Development Environment Setup
-
-Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/developer/development_guide_using_docker.md#setup-docker-container).
-
-Create and enter development container:
-```bash
-docker run -itd --shm-size 32g --gpus all -v $HOME/.cache:/root/.cache --ipc=host --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
-docker exec -it sglang_zhyncs /bin/zsh
-```
-
-## Project Structure
-
-### Dependencies
-
-Third-party libraries:
-
-- [CCCL](https://github.com/NVIDIA/cccl)
-- [CUTLASS](https://github.com/NVIDIA/cutlass)
-- [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
-- [TurboMind](https://github.com/InternLM/turbomind)
-
-### Kernel Development
-
-Steps to add a new kernel:
-
-1. Implement in [src/sgl-kernel/csrc/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/src/sgl-kernel/csrc)
-2. Expose interface in [src/sgl-kernel/include/sgl_kernels_ops.h](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/include/sgl_kernels_ops.h)
-3. Create torch extension in [src/sgl-kernel/torch_extension.cc](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/torch_extension.cc)
-4. Create Python wrapper in [src/sgl-kernel/ops/\_\_init\_\_.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/ops/__init__.py)
-5. Expose Python interface in [src/sgl-kernel/\_\_init\_\_.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/__init__.py)
-6. Update [setup.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/setup.py) to include new CUDA source
-
-### Build & Install
-
-Development build:
+### Use Makefile to build sgl-kernel
 
 ```bash
 make build
 ```
 
-Note:
+## Contribution
 
-The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
+### Steps to add a new kernel:
+
+1. Implement the kernel in [csrc](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/csrc)
+2. Expose the interface in [include/sgl_kernel_ops.h](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/include/sgl_kernel_ops.h)
+3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/csrc/common_extension.cc)
+4. Update [CMakeLists.txt](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/CMakeLists.txt) to include new CUDA source
+5. Expose Python interface in [python](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/python/sgl_kernel)
+6. Add test and benchmark
+
+### Development Tips
+
+1. When creating torch extensions, add the function definition with `m.def`, and device binding with `m.impl`:
+
+- How to write schema: [Schema reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func)
+
+   ```cpp
+   // We need def with schema here for torch.compile
+   m.def(
+    "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
+    "int cublas_handle) -> ()");
+   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
+   ```
+
+### Adapting C++ Native Types for Torch Compatibility
+
+Third-party C++ libraries often use int and float, but PyTorch bindings require int64_t and double due to Python's type mapping.
+
+Use make_pytorch_shim from sgl_kernel_torch_shim.h to handle conversions automatically:
+
+```cpp
+
+// Add type conversion for int -> int64_t
+template <>
+struct pytorch_library_compatible_type<int> {
+  using type = int64_t;
+  static int convert_from_type(int64_t arg) {
+    TORCH_CHECK(arg <= std::numeric_limits<int>::max(), "value too large");
+    TORCH_CHECK(arg >= std::numeric_limits<int>::min(), "value too small");
+    return arg;
+  }
+};
+```
+```cpp
+// Wrap your function
+m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+```
 
 ### Testing & Benchmarking
 
-1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests)
+1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`
+
+```python
+@pytest.mark.skipif(
+    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
+)
+```
+
 2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
+
+   **We recommend using `triton.testing.do_bench_cudagraph` for kernel benchmarking**:
+
+   Compared to `triton.testing.do_bench`, `do_bench_cudagraph` provides:
+   - Reduced CPU overhead impact for more accurate kernel performance measurements
+   - Incorporation of PDL (Programmatic Dependent Launch) effects into individual kernel results
+   - More realistic performance data on PDL-supported architectures (SM >= 90)
+
 3. Run test suite
 
-### Release new version
-
-Update version in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/pyproject.toml) and [version.py](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/src/sgl-kernel/version.py)
+## FAQ
+- Q: Segmentation fault with CUDA 12.6
+- A: Update ptxas to 12.8, reference: [segment fault error](https://github.com/Dao-AILab/flash-attention/issues/1453)

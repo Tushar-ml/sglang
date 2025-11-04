@@ -1,20 +1,20 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestFlashinferMLA(unittest.TestCase):
+class TestFlashinferMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -25,8 +25,9 @@ class TestFlashinferMLA(unittest.TestCase):
                 [
                     "--enable-torch-compile",
                     "--cuda-graph-max-bs",
-                    "2",
-                    "--enable-flashinfer-mla",
+                    "4",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         cls.process = popen_launch_server(
@@ -53,10 +54,10 @@ class TestFlashinferMLA(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.615)
 
 
-class TestFlashinferMLANoRagged(unittest.TestCase):
+class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -65,12 +66,21 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--enable-torch-compile",
-                    "--disable-cuda-graph",
                     "--cuda-graph-max-bs",
-                    "2",
-                    "--enable-flashinfer-mla",
-                    "--flashinfer-mla-disable-ragged",
+                    "4",
+                    "--enable-torch-compile",
+                    "--torch-compile-max-bs",
+                    "1",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         cls.process = popen_launch_server(
@@ -85,6 +95,8 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -97,7 +109,15 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        print(f"{server_info=}")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 2.5)
 
 
 if __name__ == "__main__":

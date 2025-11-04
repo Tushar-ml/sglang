@@ -1,24 +1,9 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.lora.utils import LoRABatchInfo
-
-
-def get_fuse_output_scaling_add_from_name(name: str) -> bool:
-    mapping = {
-        "triton": True,
-        "flashinfer": False,
-    }
-    return mapping.get(name, False)
-
-
-def get_fuse_stacked_lora_b_from_name(name: str) -> bool:
-    mapping = {
-        "triton": True,
-        "flashinfer": False,
-    }
-    return mapping.get(name, False)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class BaseLoRABackend:
@@ -26,17 +11,14 @@ class BaseLoRABackend:
        Each backend has its own implementation of Lora kernels.
 
     Args:
-        name: name of backend
-        batch_info: information of current batch for use
-        fuse_output_scaling_add: if set to True, the output buffer for storing result will be passed in when doing lora_b forward,
-                                 and the operation of scaling and adding will be fused into kernel
+        max_loras_per_batch: maximum number of different lora weights
+                             that can be applied in a single forward batch.
+        device: the device where the backend runs.
     """
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
-        self.name = name
-        self.batch_info = batch_info
-        self.fuse_output_scaling_add = get_fuse_output_scaling_add_from_name(name)
-        self.fuse_stacked_lora_b = get_fuse_stacked_lora_b_from_name(name)
+    def __init__(self, max_loras_per_batch: int, device: torch.device):
+        self.max_loras_per_batch = max_loras_per_batch
+        self.device = device
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -75,7 +57,7 @@ class BaseLoRABackend:
         qkv_lora_a: torch.Tensor,
         qkv_lora_b: Union[torch.Tensor, Tuple[torch.Tensor]],
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """Run the lora pass for QKV Layer.
 
@@ -98,7 +80,7 @@ class BaseLoRABackend:
         gate_up_lora_a: torch.Tensor,
         gate_up_lora_b: Union[torch.Tensor, Tuple[torch.Tensor]],
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """Run the lora pass for gate_up_proj, usually attached to MergedColumnParallelLayer.
 
@@ -113,5 +95,61 @@ class BaseLoRABackend:
         """
         pass
 
-    def set_batch_info(self, batch_info: LoRABatchInfo):
-        self.batch_info = batch_info
+    def init_cuda_graph_batch_info(
+        self,
+        cuda_graph_batch_info: LoRABatchInfo,
+        max_bs_in_cuda_graph: int,
+    ):
+        """Initialize the batch info for CUDA Graph mode.
+
+        This method provides a hook for each backend to conduct its own initialization
+        logic for CUDA Graph mode.
+
+        Args:
+            cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
+            max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
+        """
+        pass
+
+    def prepare_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+        batch_info: Optional[LoRABatchInfo] = None,
+    ):
+        """Prepare the lora weights and batch info for current forward batch.
+
+        This method provides a hook for each backend to conduct its own preparation
+        logic for each forward batch.
+
+        Args:
+            forward_batch: the ForwardBatch object for current forward pass
+            weight_indices: list of indices of lora weights to be applied for current batch
+            lora_ranks: list of lora ranks corresponding to weight_indices
+            scalings: list of scaling factors corresponding to weight_indices
+            batch_info: optional LoRABatchInfo object, if not provided, the backend should use its own
+                        internal batch info (e.g., self.cuda_graph_batch_info for CUDA Graph mode)
+        """
+        pass
+
+
+def get_backend_from_name(name: str) -> BaseLoRABackend:
+    """
+    Get corresponding backend class from backend's name
+    """
+    if name == "triton":
+        from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+
+        return TritonLoRABackend
+    elif name == "csgmv":
+        from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+
+        return ChunkedSgmvLoRABackend
+    elif name == "flashinfer":
+        raise ValueError(
+            "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
+        )
+    else:
+        raise ValueError(f"Invalid backend: {name}")

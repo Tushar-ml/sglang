@@ -1,18 +1,13 @@
-import itertools
 import json
-import os
 import random
-import string
-import threading
 import time
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import Union
 
 from tqdm import tqdm
 
 import sglang as sgl
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -89,7 +84,7 @@ def main(args):
 
     backend = select_sglang_backend(args)
 
-    tic = time.time()
+    tic = time.perf_counter()
     states = multi_turns.run_batch(
         multi_qas,
         temperature=0,
@@ -97,7 +92,7 @@ def main(args):
         num_threads="auto",
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     print(f"Latency: {latency:.3f}")
 
