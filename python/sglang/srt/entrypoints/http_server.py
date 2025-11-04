@@ -403,6 +403,10 @@ async def validate_json_request(raw_request: Request):
 
 
 @app.get("/health")
+def health():
+    return Response(status_code=200)
+
+
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
