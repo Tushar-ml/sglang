@@ -901,6 +901,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "VisionTextDualEncoderModel" in model_architectures
     ):
         return False
     else:
@@ -945,6 +946,7 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "VisionTextDualEncoderModel",
 ]
 
 
@@ -982,6 +984,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
         "CLIPModel",
+        "VisionTextDualEncoderModel",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
         return False

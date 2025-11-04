@@ -335,4 +335,8 @@ class XLMRobertaForSequenceClassification(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [XLMRobertaModel, XLMRobertaForSequenceClassification]
+class RobertaForMaskedLM(XLMRobertaBaseModel):
+    pass
+
+
+EntryClass = [XLMRobertaModel, XLMRobertaForSequenceClassification, RobertaForMaskedLM]
