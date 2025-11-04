@@ -109,7 +109,8 @@ class VisionTextDualEncoderModel(nn.Module):
                 get_embedding=True,
             )
             pooled_output = self.text_projection(text_outputs)
-            return EmbeddingPoolerOutput(embeddings=pooled_output)
+            pooled_output = self.pooler(pooled_output, forward_batch)
+            return pooled_output
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids

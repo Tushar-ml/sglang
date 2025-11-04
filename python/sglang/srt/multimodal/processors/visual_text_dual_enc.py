@@ -19,6 +19,10 @@ class VisionTextDualEncoderProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
+
+        if len(image_data) > 0:
+            input_text = "<image>"
+
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
