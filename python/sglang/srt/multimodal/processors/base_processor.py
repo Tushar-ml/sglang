@@ -679,6 +679,8 @@ class BaseMultimodalProcessor(ABC):
         for mm_item in all_collected_items:
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
+                if kwargs.get("ignore_missing_token_id", False):
+                    continue
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")
             mm_item.offsets = self.get_mm_items_offset(
                 input_ids=input_ids,

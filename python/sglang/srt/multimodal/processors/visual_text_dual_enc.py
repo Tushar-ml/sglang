@@ -1,14 +1,14 @@
 from typing import List, Union
 
-from sglang.srt.models.clip import CLIPModel
+from sglang.srt.models.visual_text_dual_enc import VisionTextDualEncoderModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 
 
-class ClipImageProcessor(BaseMultimodalProcessor):
-    models = [CLIPModel]
+class VisionTextDualEncoderProcessor(BaseMultimodalProcessor):
+    models = [VisionTextDualEncoderModel]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -19,6 +19,10 @@ class ClipImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
+
+        if len(image_data) > 0:
+            input_text = "<image>"
+
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
