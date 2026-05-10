@@ -314,8 +314,9 @@ class Engine(EngineScoreMixin, EngineBase):
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None,
-        
+        input_embeds: Optional[
+            Union[List[List[List[float]]], List[List[float]]]
+        ] = None,
         # The image input. It can be an image instance, file name, URL, or base64 encoded string.
         # Can be formatted as:
         # - Single image for a single request
@@ -407,7 +408,9 @@ class Engine(EngineScoreMixin, EngineBase):
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None,
+        input_embeds: Optional[
+            Union[List[List[List[float]]], List[List[float]]]
+        ] = None,
         # The image input. It can be an image instance, file name, URL, or base64 encoded string.
         # Can be formatted as:
         # - Single image for a single request
