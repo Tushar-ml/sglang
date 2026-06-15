@@ -64,6 +64,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
+  m.def("gemma4_rmsnorm_residual_scalar(Tensor x, Tensor w, Tensor r, Tensor scalar, float eps) -> Tensor");
+  m.impl("gemma4_rmsnorm_residual_scalar", torch::kCUDA, &gemma4_rmsnorm_residual_scalar);
+
+  m.def(
+      "gemma4_dual_rmsnorm_residual_scalar(Tensor x1, Tensor w1, Tensor x2, Tensor w2, Tensor w3,"
+      " Tensor r, Tensor scalar, float eps1, float eps2, float eps3) -> Tensor");
+  m.impl("gemma4_dual_rmsnorm_residual_scalar", torch::kCUDA, &gemma4_dual_rmsnorm_residual_scalar);
+
+  m.def(
+      "gemma4_qkv_rmsnorm(Tensor! q, Tensor? k, Tensor? v, Tensor q_w, Tensor? k_w,"
+      " int num_q_heads, int num_kv_heads, int head_dim, float eps) -> ()");
+  m.impl("gemma4_qkv_rmsnorm", torch::kCUDA, &gemma4_qkv_rmsnorm);
+
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
@@ -173,6 +186,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
+
+  m.def(
+      "gemma4_routing_post_topk(Tensor topk_logits, Tensor topk_ids, Tensor per_expert_scale)"
+      " -> (Tensor, Tensor)");
+  m.impl("gemma4_routing_post_topk", torch::kCUDA, &gemma4_routing_post_topk);
+
+  m.def(
+      "gemma4_fused_routing(Tensor gating_output, Tensor per_expert_scale, int topk)"
+      " -> (Tensor, Tensor)");
+  m.impl("gemma4_fused_routing", torch::kCUDA, &gemma4_fused_routing);
 
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
