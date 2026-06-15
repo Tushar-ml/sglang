@@ -1,15 +1,25 @@
 """Fused ops for Gemma4 decoder layer operations.
 
-On CUDA, delegates to AOT kernels registered under torch.ops.sgl_kernel.
-On XPU (and CPU fallback), uses the original Triton implementations below.
+Autotuned Triton kernels are used on CUDA and XPU (benchmarks show Triton
+outperforms the AOT CUDA kernels for all five operations on H100).
+AOT sgl_kernel ops serve as fallback when Triton is not installed.
 """
 
 from typing import Optional
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
+
 # ---------------------------------------------------------------------------
-# CUDA path via sgl_kernel (no Triton dependency on CUDA)
+# Public dispatchers — prefer autotuned Triton; fall back to AOT sgl_kernel.
 # ---------------------------------------------------------------------------
 
 
@@ -21,11 +31,11 @@ def gemma_rmsnorm_residual_scalar(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Fused (rmsnorm(x) + residual) * scalar."""
-    if x.is_cuda:
-        return torch.ops.sgl_kernel.gemma4_rmsnorm_residual_scalar.default(
-            x, weight, residual, scalar.to(torch.float32), eps
-        )
-    return _triton_rmsnorm_residual_scalar(x, weight, residual, scalar, eps)
+    if _TRITON_AVAILABLE:
+        return _triton_rmsnorm_residual_scalar(x, weight, residual, scalar, eps)
+    return torch.ops.sgl_kernel.gemma4_rmsnorm_residual_scalar.default(
+        x, weight, residual, scalar.to(torch.float32), eps
+    )
 
 
 def gemma_dual_rmsnorm_residual_scalar(
@@ -41,21 +51,21 @@ def gemma_dual_rmsnorm_residual_scalar(
     eps3: float = 1e-6,
 ) -> torch.Tensor:
     """Fused (rmsnorm(rmsnorm(x1,w1) + rmsnorm(x2,w2), w3) + residual) * scalar."""
-    if x1.is_cuda:
-        return torch.ops.sgl_kernel.gemma4_dual_rmsnorm_residual_scalar.default(
-            x1,
-            weight1,
-            x2,
-            weight2,
-            weight3,
-            residual,
-            scalar.to(torch.float32),
-            eps1,
-            eps2,
-            eps3,
+    if _TRITON_AVAILABLE:
+        return _triton_dual_rmsnorm_residual_scalar(
+            x1, weight1, x2, weight2, weight3, residual, scalar, eps1, eps2, eps3
         )
-    return _triton_dual_rmsnorm_residual_scalar(
-        x1, weight1, x2, weight2, weight3, residual, scalar, eps1, eps2, eps3
+    return torch.ops.sgl_kernel.gemma4_dual_rmsnorm_residual_scalar.default(
+        x1,
+        weight1,
+        x2,
+        weight2,
+        weight3,
+        residual,
+        scalar.to(torch.float32),
+        eps1,
+        eps2,
+        eps3,
     )
 
 
@@ -71,20 +81,12 @@ def gemma_qkv_rmsnorm(
     eps: float = 1e-6,
 ) -> None:
     """In-place fused RMSNorm on Q, K, V for Gemma4 attention."""
-    if q.is_cuda:
-        torch.ops.sgl_kernel.gemma4_qkv_rmsnorm.default(
-            q,
-            k,
-            v,
-            q_weight,
-            k_weight,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            eps,
+    if _TRITON_AVAILABLE:
+        _triton_qkv_rmsnorm(
+            q, k, v, q_weight, k_weight, num_q_heads, num_kv_heads, head_dim, eps
         )
         return
-    _triton_qkv_rmsnorm(
+    torch.ops.sgl_kernel.gemma4_qkv_rmsnorm.default(
         q, k, v, q_weight, k_weight, num_q_heads, num_kv_heads, head_dim, eps
     )
 
@@ -95,12 +97,12 @@ def gemma_routing_post_topk(
     per_expert_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused softmax + scale-gather + casts for Gemma4 routing."""
-    if topk_logits.is_cuda:
-        out = torch.ops.sgl_kernel.gemma4_routing_post_topk.default(
-            topk_logits, topk_ids, per_expert_scale
-        )
-        return out[0], out[1]
-    return _triton_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
+    if _TRITON_AVAILABLE:
+        return _triton_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
+    out = torch.ops.sgl_kernel.gemma4_routing_post_topk.default(
+        topk_logits, topk_ids, per_expert_scale
+    )
+    return out[0], out[1]
 
 
 def gemma4_fused_routing(
@@ -109,91 +111,118 @@ def gemma4_fused_routing(
     topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One-launch Gemma4 router."""
-    if gating_output.is_cuda:
-        out = torch.ops.sgl_kernel.gemma4_fused_routing.default(
-            gating_output, per_expert_scale, topk
+    if _TRITON_AVAILABLE:
+        return _triton_fused_routing(gating_output, per_expert_scale, topk)
+    out = torch.ops.sgl_kernel.gemma4_fused_routing.default(
+        gating_output, per_expert_scale, topk
+    )
+    return out[0], out[1]
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel launchers and definitions
+# ---------------------------------------------------------------------------
+
+if _TRITON_AVAILABLE:
+
+    def _m_bucket(M: int) -> int:
+        """Coarse-bucket M for autotune key — avoids per-row retuning."""
+        if M <= 1:
+            return 1
+        elif M <= 8:
+            return 8
+        elif M <= 64:
+            return 64
+        elif M <= 512:
+            return 512
+        else:
+            return 4096
+
+    def _triton_rmsnorm_residual_scalar(x, weight, residual, scalar, eps):
+        assert x.dim() == 2 and x.stride(-1) == 1, "Expected contiguous 2D input"
+        M, N = x.shape
+        BLOCK_SIZE = triton.next_power_of_2(N)
+        out = torch.empty_like(x)
+        _gemma_rmsnorm_residual_kernel[(M,)](
+            x,
+            weight,
+            residual,
+            scalar,
+            out,
+            x.stride(0),
+            residual.stride(0),
+            out.stride(0),
+            _m_bucket(M),
+            N,
+            eps,
+            HAS_SCALAR=True,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
-        return out[0], out[1]
-    return _triton_fused_routing(gating_output, per_expert_scale, topk)
+        return out
 
+    def _triton_dual_rmsnorm_residual_scalar(
+        x1, w1, x2, w2, w3, r, scalar, eps1, eps2, eps3
+    ):
+        assert x1.dim() == 2 and x1.stride(-1) == 1
+        M, N = x1.shape
+        BLOCK_SIZE = triton.next_power_of_2(N)
+        out = torch.empty_like(x1)
+        _gemma_dual_rmsnorm_residual_kernel[(M,)](
+            x1,
+            w1,
+            x2,
+            w2,
+            w3,
+            r,
+            scalar,
+            out,
+            x1.stride(0),
+            x2.stride(0),
+            r.stride(0),
+            out.stride(0),
+            _m_bucket(M),
+            N,
+            eps1,
+            eps2,
+            eps3,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return out
 
-# ---------------------------------------------------------------------------
-# Triton fallback (XPU / CPU)
-# ---------------------------------------------------------------------------
-
-
-def _triton_rmsnorm_residual_scalar(x, weight, residual, scalar, eps):
-    import triton
-
-    assert x.dim() == 2 and x.stride(-1) == 1, "Expected contiguous 2D input"
-    M, N = x.shape
-    BLOCK_SIZE = triton.next_power_of_2(N)
-    out = torch.empty_like(x)
-    _gemma_rmsnorm_residual_kernel[(M,)](
-        x,
-        weight,
-        residual,
-        scalar,
-        out,
-        x.stride(0),
-        residual.stride(0),
-        out.stride(0),
-        N,
-        eps,
-        HAS_SCALAR=True,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return out
-
-
-def _triton_dual_rmsnorm_residual_scalar(
-    x1, w1, x2, w2, w3, r, scalar, eps1, eps2, eps3
-):
-    import triton
-
-    assert x1.dim() == 2 and x1.stride(-1) == 1
-    M, N = x1.shape
-    BLOCK_SIZE = triton.next_power_of_2(N)
-    out = torch.empty_like(x1)
-    _gemma_dual_rmsnorm_residual_kernel[(M,)](
-        x1,
-        w1,
-        x2,
-        w2,
-        w3,
-        r,
-        scalar,
-        out,
-        x1.stride(0),
-        x2.stride(0),
-        r.stride(0),
-        out.stride(0),
-        N,
-        eps1,
-        eps2,
-        eps3,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return out
-
-
-def _triton_qkv_rmsnorm(
-    q, k, v, q_weight, k_weight, num_q_heads, num_kv_heads, head_dim, eps
-):
-    import triton
-
-    assert q.is_cuda or q.is_xpu
-    assert q.stride(-1) == 1
-    assert q_weight.shape[-1] == head_dim
-    M = q.shape[0] if q.dim() >= 2 else 1
-    BLOCK = triton.next_power_of_2(head_dim)
-    has_kv = k is not None and v is not None
-    if has_kv:
-        assert k.stride(-1) == 1 and v.stride(-1) == 1
-        assert k_weight is not None and k_weight.shape[-1] == head_dim
-    if M <= 256:
-        total_heads = num_q_heads + (2 * num_kv_heads if has_kv else 0)
-        _gemma_qkv_rmsnorm_kernel[(M, total_heads)](
+    def _triton_qkv_rmsnorm(
+        q, k, v, q_weight, k_weight, num_q_heads, num_kv_heads, head_dim, eps
+    ):
+        assert q.stride(-1) == 1
+        M = q.shape[0] if q.dim() >= 2 else 1
+        BLOCK = triton.next_power_of_2(head_dim)
+        # One warp per 32 elements gives good occupancy without excess sync.
+        num_warps = min(max(head_dim // 32, 1), 32)
+        has_kv = k is not None and v is not None
+        if has_kv:
+            assert k.stride(-1) == 1 and v.stride(-1) == 1
+            assert k_weight is not None and k_weight.shape[-1] == head_dim
+        if M <= 256:
+            total_heads = num_q_heads + (2 * num_kv_heads if has_kv else 0)
+            _gemma_qkv_rmsnorm_kernel[(M, total_heads)](
+                q,
+                k if has_kv else q,
+                v if has_kv else q,
+                q_weight,
+                k_weight if has_kv else q_weight,
+                q.stride(0),
+                k.stride(0) if has_kv else 0,
+                v.stride(0) if has_kv else 0,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_KV_HEADS=num_kv_heads if has_kv else 0,
+                HEAD_DIM=head_dim,
+                eps=eps,
+                HAS_KV=has_kv,
+                BY_HEAD=True,
+                BLOCK=BLOCK,
+                num_warps=num_warps,
+            )
+            return
+        _gemma_qkv_rmsnorm_kernel[(M,)](
             q,
             k if has_kv else q,
             v if has_kv else q,
@@ -207,86 +236,76 @@ def _triton_qkv_rmsnorm(
             HEAD_DIM=head_dim,
             eps=eps,
             HAS_KV=has_kv,
-            BY_HEAD=True,
+            BY_HEAD=False,
             BLOCK=BLOCK,
+            num_warps=num_warps,
         )
-        return
-    _gemma_qkv_rmsnorm_kernel[(M,)](
-        q,
-        k if has_kv else q,
-        v if has_kv else q,
-        q_weight,
-        k_weight if has_kv else q_weight,
-        q.stride(0),
-        k.stride(0) if has_kv else 0,
-        v.stride(0) if has_kv else 0,
-        NUM_Q_HEADS=num_q_heads,
-        NUM_KV_HEADS=num_kv_heads if has_kv else 0,
-        HEAD_DIM=head_dim,
-        eps=eps,
-        HAS_KV=has_kv,
-        BY_HEAD=False,
-        BLOCK=BLOCK,
-    )
 
+    def _triton_routing_post_topk(topk_logits, topk_ids, per_expert_scale):
+        B, K = topk_logits.shape
+        BLOCK_K = triton.next_power_of_2(K)
+        out_weights = torch.empty(
+            (B, K), dtype=torch.float32, device=topk_logits.device
+        )
+        out_ids = torch.empty((B, K), dtype=torch.int32, device=topk_logits.device)
+        _gemma_routing_post_topk_kernel[(B,)](
+            topk_logits,
+            topk_ids,
+            per_expert_scale,
+            out_weights,
+            out_ids,
+            topk_logits.stride(0),
+            out_weights.stride(0),
+            out_ids.stride(0),
+            K=K,
+            BLOCK_K=BLOCK_K,
+        )
+        return out_weights, out_ids
 
-def _triton_routing_post_topk(topk_logits, topk_ids, per_expert_scale):
-    B, K = topk_logits.shape
-    import triton
-
-    BLOCK_K = triton.next_power_of_2(K)
-    out_weights = torch.empty((B, K), dtype=torch.float32, device=topk_logits.device)
-    out_ids = torch.empty((B, K), dtype=torch.int32, device=topk_logits.device)
-    _gemma_routing_post_topk_kernel[(B,)](
-        topk_logits,
-        topk_ids,
-        per_expert_scale,
-        out_weights,
-        out_ids,
-        topk_logits.stride(0),
-        out_weights.stride(0),
-        out_ids.stride(0),
-        K=K,
-        BLOCK_K=BLOCK_K,
-    )
-    return out_weights, out_ids
-
-
-def _triton_fused_routing(gating_output, per_expert_scale, topk):
-    import triton
-
-    T, E = gating_output.shape
-    assert topk <= E
-    assert E <= 1024
-    BLOCK_E = triton.next_power_of_2(E)
-    topk_weights = torch.empty(
-        (T, topk), dtype=torch.float32, device=gating_output.device
-    )
-    topk_ids = torch.empty((T, topk), dtype=torch.int32, device=gating_output.device)
-    if T == 0:
+    def _triton_fused_routing(gating_output, per_expert_scale, topk):
+        T, E = gating_output.shape
+        assert topk <= E
+        assert E <= 1024
+        BLOCK_E = triton.next_power_of_2(E)
+        topk_weights = torch.empty(
+            (T, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (T, topk), dtype=torch.int32, device=gating_output.device
+        )
+        if T == 0:
+            return topk_weights, topk_ids
+        # tl.sort is most efficient with few warps: 1 warp per 256 experts.
+        num_warps = max(1, BLOCK_E // 256)
+        _gemma4_routing_kernel[(T,)](
+            gating_output,
+            per_expert_scale,
+            topk_weights,
+            topk_ids,
+            gating_output.stride(0),
+            E=E,
+            K=topk,
+            BLOCK_E=BLOCK_E,
+            num_warps=num_warps,
+        )
         return topk_weights, topk_ids
-    _gemma4_routing_kernel[(T,)](
-        gating_output,
-        per_expert_scale,
-        topk_weights,
-        topk_ids,
-        gating_output.stride(0),
-        E=E,
-        K=topk,
-        BLOCK_E=BLOCK_E,
-        num_warps=1,
+
+    # -----------------------------------------------------------------------
+    # Kernel: _gemma_rmsnorm_residual_kernel
+    # Autotuned on num_warps/num_stages keyed by (M_BUCKET, N).
+    # M_BUCKET discretises the batch size so decode (M≤1) and large-prefill
+    # (M≥512) each get their own optimal warp count.
+    # BLOCK_SIZE is caller-computed as next_power_of_2(N).
+    # -----------------------------------------------------------------------
+
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=nw, num_stages=ns)
+            for nw in [1, 2, 4, 8, 16, 32]
+            for ns in [1, 2, 3]
+        ],
+        key=["M_BUCKET", "N"],
     )
-    return topk_weights, topk_ids
-
-
-# ---------------------------------------------------------------------------
-# Triton kernel definitions (used only on XPU/non-CUDA paths)
-# ---------------------------------------------------------------------------
-
-try:
-    import triton
-    import triton.language as tl
-
     @triton.jit
     def _gemma_rmsnorm_residual_kernel(
         X_ptr,
@@ -297,6 +316,7 @@ try:
         stride_x,
         stride_r,
         stride_o,
+        M_BUCKET,  # coarse M bucket — autotune key only, not used in body
         N,
         eps,
         HAS_SCALAR: tl.constexpr,
@@ -318,6 +338,18 @@ try:
             out = out * scalar
         tl.store(Out_ptr + row * stride_o + cols, out.to(x.dtype), mask=mask)
 
+    # -----------------------------------------------------------------------
+    # Kernel: _gemma_dual_rmsnorm_residual_kernel
+    # -----------------------------------------------------------------------
+
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=nw, num_stages=ns)
+            for nw in [1, 2, 4, 8, 16, 32]
+            for ns in [1, 2, 3]
+        ],
+        key=["M_BUCKET", "N"],
+    )
     @triton.jit
     def _gemma_dual_rmsnorm_residual_kernel(
         X1_ptr,
@@ -332,6 +364,7 @@ try:
         stride_x2,
         stride_r,
         stride_o,
+        M_BUCKET,  # autotune key only
         N,
         eps1,
         eps2,
@@ -363,6 +396,12 @@ try:
         scalar = tl.load(Scalar_ptr).to(tl.float32)
         out = (norm3 + r) * scalar
         tl.store(Out_ptr + row * stride_o + cols, out.to(x1.dtype), mask=mask)
+
+    # -----------------------------------------------------------------------
+    # Kernel: _gemma_qkv_rmsnorm_kernel
+    # num_warps set by launcher heuristic (head_dim // 32).
+    # No autotune: NUM_Q/KV_HEADS are tl.constexpr required by tl.static_range.
+    # -----------------------------------------------------------------------
 
     @triton.jit
     def _gemma_qkv_rmsnorm_store(
@@ -465,6 +504,10 @@ try:
                         False,
                     )
 
+    # -----------------------------------------------------------------------
+    # Kernel: _gemma_routing_post_topk_kernel
+    # -----------------------------------------------------------------------
+
     @triton.jit
     def _gemma_routing_post_topk_kernel(
         Logits_ptr,
@@ -494,6 +537,13 @@ try:
         tl.store(Out_weights_ptr + row * stride_ow + cols, weights, mask=mask)
         tl.store(Out_ids_ptr + row * stride_oi + cols, ids_i64.to(tl.int32), mask=mask)
 
+    # -----------------------------------------------------------------------
+    # Kernel: _gemma4_routing_kernel
+    # num_warps set by launcher heuristic (BLOCK_E // 256, min 1).
+    # E and K are runtime args (non-constexpr) — BLOCK_E stays constexpr
+    # because it is used in tl.arange.
+    # -----------------------------------------------------------------------
+
     @triton.jit
     def _gemma4_routing_kernel(
         gating_ptr,
@@ -501,9 +551,9 @@ try:
         topk_weights_ptr,
         topk_ids_ptr,
         stride_g_t,
-        E: tl.constexpr,
-        K: tl.constexpr,
-        BLOCK_E: tl.constexpr,
+        E,  # runtime — used for valid mask
+        K,  # runtime — used for top-K mask and store offset
+        BLOCK_E: tl.constexpr,  # caller-computed next_power_of_2(E)
     ):
         pid = tl.program_id(0)
         offs_e = tl.arange(0, BLOCK_E)
@@ -541,6 +591,3 @@ try:
         base_off = pid * K + offs_e
         tl.store(topk_weights_ptr + base_off, weights, mask=top_mask)
         tl.store(topk_ids_ptr + base_off, all_ids, mask=top_mask)
-
-except ImportError:
-    pass  # Triton not available; CUDA path is used on CUDA devices

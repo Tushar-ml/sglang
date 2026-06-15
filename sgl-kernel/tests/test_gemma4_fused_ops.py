@@ -23,8 +23,8 @@ def rtol_atol(dtype):
     if dtype == torch.float32:
         return (1e-5, 1e-5)
     if dtype == torch.bfloat16:
-        # bf16 has only 7 mantissa bits; one ULP at magnitude ~2 is ~0.004
-        return (2e-3, 5e-3)
+        # bf16 has only 7 mantissa bits; one ULP at magnitude ~2 is ~0.016
+        return (2e-3, 2e-2)
     return (1e-3, 1e-3)
 
 
