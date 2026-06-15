@@ -122,30 +122,6 @@ void musa_fused_add_rms_norm(
     torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
-// Gemma4 fused ops (csrc/elementwise/gemma4_fused_ops.cu)
-torch::Tensor
-gemma4_rmsnorm_residual_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor r, torch::Tensor scalar, double eps);
-torch::Tensor gemma4_dual_rmsnorm_residual_scalar(
-    torch::Tensor x1,
-    torch::Tensor w1,
-    torch::Tensor x2,
-    torch::Tensor w2,
-    torch::Tensor w3,
-    torch::Tensor r,
-    torch::Tensor scalar,
-    double eps1,
-    double eps2,
-    double eps3);
-void gemma4_qkv_rmsnorm(
-    at::Tensor& q,
-    const std::optional<at::Tensor>& k,
-    const std::optional<at::Tensor>& v,
-    const at::Tensor& q_w,
-    const std::optional<at::Tensor>& k_w,
-    int64_t num_q_heads,
-    int64_t num_kv_heads,
-    int64_t head_dim,
-    double eps);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -292,11 +268,6 @@ void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 /*
  * From csrc/moe
  */
-// Gemma4 routing ops (csrc/moe/gemma4_routing.cu)
-std::tuple<at::Tensor, at::Tensor>
-gemma4_routing_post_topk(torch::Tensor topk_logits, torch::Tensor topk_ids, torch::Tensor per_expert_scale);
-std::tuple<at::Tensor, at::Tensor>
-gemma4_fused_routing(torch::Tensor gating_output, torch::Tensor per_expert_scale, int64_t topk);
 void moe_align_block_size(
     torch::Tensor topk_ids,
     int64_t num_experts,

@@ -1,19 +1,21 @@
-"""Tests for gemma4_fused_ops CUDA kernels vs Triton reference."""
+"""Tests for Gemma4 Triton fused ops."""
+
+import sys
 
 import pytest
 import torch
 
-# ---------------------------------------------------------------------------
-# Skip the whole module if CUDA is unavailable or sgl_kernel is not built
-# ---------------------------------------------------------------------------
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-try:
-    import sgl_kernel  # noqa: F401 — triggers op registration
-except ImportError:
-    pytest.skip("sgl_kernel not installed", allow_module_level=True)
-
+sys.path.insert(0, "python")
+from sglang.srt.layers.gemma4_fused_ops import (  # noqa: E402
+    gemma4_fused_routing,
+    gemma_dual_rmsnorm_residual_scalar,
+    gemma_qkv_rmsnorm,
+    gemma_rmsnorm_residual_scalar,
+    gemma_routing_post_topk,
+)
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 EPS = 1e-6
@@ -29,7 +31,7 @@ def rtol_atol(dtype):
 
 
 # ---------------------------------------------------------------------------
-# gemma4_rmsnorm_residual_scalar
+# gemma_rmsnorm_residual_scalar
 # ---------------------------------------------------------------------------
 class TestRMSNormResidualScalar:
     @pytest.mark.parametrize("dtype", DTYPES)
@@ -40,7 +42,6 @@ class TestRMSNormResidualScalar:
         r = torch.randn(M, N, dtype=dtype, device="cuda")
         scalar = torch.tensor([0.7], dtype=torch.float32, device="cuda")
 
-        # Reference: pure torch
         x_f = x.float()
         w_f = w.float()
         r_f = r.float()
@@ -48,16 +49,14 @@ class TestRMSNormResidualScalar:
         rrms = torch.rsqrt(var + EPS)
         ref = ((x_f * rrms * w_f + r_f) * 0.7).to(dtype)
 
-        out = torch.ops.sgl_kernel.gemma4_rmsnorm_residual_scalar.default(
-            x, w, r, scalar, EPS
-        )
+        out = gemma_rmsnorm_residual_scalar(x, w, r, scalar, EPS)
         torch.testing.assert_close(
             out, ref, **dict(zip(["rtol", "atol"], rtol_atol(dtype)))
         )
 
 
 # ---------------------------------------------------------------------------
-# gemma4_dual_rmsnorm_residual_scalar
+# gemma_dual_rmsnorm_residual_scalar
 # ---------------------------------------------------------------------------
 class TestDualRMSNormResidualScalar:
     @pytest.mark.parametrize("dtype", DTYPES)
@@ -82,17 +81,8 @@ class TestDualRMSNormResidualScalar:
             return ((n3 + rf) * sc).to(x1.dtype)
 
         ref = ref_dual(x1, w1, x2, w2, w3, r, 0.5, EPS)
-        out = torch.ops.sgl_kernel.gemma4_dual_rmsnorm_residual_scalar.default(
-            x1,
-            w1,
-            x2,
-            w2,
-            w3,
-            r,
-            torch.tensor([0.5], dtype=torch.float32, device="cuda"),
-            EPS,
-            EPS,
-            EPS,
+        out = gemma_dual_rmsnorm_residual_scalar(
+            x1, w1, x2, w2, w3, r, scalar, EPS, EPS, EPS
         )
         torch.testing.assert_close(
             out, ref, **dict(zip(["rtol", "atol"], rtol_atol(dtype)))
@@ -100,7 +90,7 @@ class TestDualRMSNormResidualScalar:
 
 
 # ---------------------------------------------------------------------------
-# gemma4_qkv_rmsnorm
+# gemma_qkv_rmsnorm
 # ---------------------------------------------------------------------------
 class TestQKVRMSNorm:
     @pytest.mark.parametrize("dtype", DTYPES)
@@ -129,20 +119,20 @@ class TestQKVRMSNorm:
                 out = out * w.float()
             return out.to(x.dtype)
 
-        # Build reference using view/unflatten
-        q_ref = q.clone().unflatten(-1, (num_q, head_dim))
-        q_ref = ref_head_norm(q_ref, q_w, True).flatten(-2)
-        k_ref = k.clone().unflatten(-1, (num_kv, head_dim))
-        k_ref = ref_head_norm(k_ref, k_w, True).flatten(-2)
-        v_ref = v.clone().unflatten(-1, (num_kv, head_dim))
-        v_ref = ref_head_norm(v_ref, None, False).flatten(-2)
+        q_ref = ref_head_norm(
+            q.clone().unflatten(-1, (num_q, head_dim)), q_w, True
+        ).flatten(-2)
+        k_ref = ref_head_norm(
+            k.clone().unflatten(-1, (num_kv, head_dim)), k_w, True
+        ).flatten(-2)
+        v_ref = ref_head_norm(
+            v.clone().unflatten(-1, (num_kv, head_dim)), None, False
+        ).flatten(-2)
 
         q_out = q.clone()
         k_out = k.clone()
         v_out = v.clone()
-        torch.ops.sgl_kernel.gemma4_qkv_rmsnorm.default(
-            q_out, k_out, v_out, q_w, k_w, num_q, num_kv, head_dim, EPS
-        )
+        gemma_qkv_rmsnorm(q_out, k_out, v_out, q_w, k_w, num_q, num_kv, head_dim, EPS)
         rtol, atol = rtol_atol(dtype)
         torch.testing.assert_close(q_out, q_ref, rtol=rtol, atol=atol)
         torch.testing.assert_close(k_out, k_ref, rtol=rtol, atol=atol)
@@ -163,16 +153,14 @@ class TestQKVRMSNorm:
             -2
         )
         q_out = q.clone()
-        torch.ops.sgl_kernel.gemma4_qkv_rmsnorm.default(
-            q_out, None, None, q_w, None, num_q, 0, head_dim, EPS
-        )
+        gemma_qkv_rmsnorm(q_out, None, None, q_w, None, num_q, 0, head_dim, EPS)
         torch.testing.assert_close(
             q_out, q_ref, **dict(zip(["rtol", "atol"], rtol_atol(dtype)))
         )
 
 
 # ---------------------------------------------------------------------------
-# gemma4_routing_post_topk
+# gemma_routing_post_topk
 # ---------------------------------------------------------------------------
 class TestRoutingPostTopK:
     @pytest.mark.parametrize("dtype", DTYPES)
@@ -182,16 +170,13 @@ class TestRoutingPostTopK:
         ids = torch.randint(0, E, (B, K), dtype=torch.int64, device="cuda")
         scale = torch.rand(E, dtype=torch.float32, device="cuda") + 0.5
 
-        # Reference
         logits_f = logits.float()
         softmax = torch.softmax(logits_f, dim=-1)
         sc = scale[ids.long()]
         ref_w = (softmax * sc).float()
         ref_ids = ids.int()
 
-        w, out_ids = torch.ops.sgl_kernel.gemma4_routing_post_topk.default(
-            logits, ids, scale
-        )
+        w, out_ids = gemma_routing_post_topk(logits, ids, scale)
         torch.testing.assert_close(w, ref_w, rtol=1e-3, atol=1e-4)
         assert (out_ids == ref_ids).all()
 
@@ -215,18 +200,14 @@ class TestFusedRouting:
         gating = torch.randn(T, E, dtype=dtype, device="cuda")
         scale = torch.rand(E, dtype=torch.float32, device="cuda") + 0.5
 
-        # Reference: topk → softmax → scale gather
         logits_f = gating.float()
         topk_logits, topk_ids = torch.topk(logits_f, k=K, dim=-1)
         softmax = torch.softmax(topk_logits, dim=-1)
         ref_w = (softmax * scale[topk_ids]).float()
         ref_ids = topk_ids.int()
 
-        w, out_ids = torch.ops.sgl_kernel.gemma4_fused_routing.default(gating, scale, K)
+        w, out_ids = gemma4_fused_routing(gating, scale, K)
 
-        # Sort both by expert_id before comparing to avoid tie-breaking differences.
-        # When two experts have equal bf16 logits their order is implementation-defined,
-        # so we compare the SET of selected experts and their corresponding weights.
         ref_order = ref_ids.argsort(dim=-1)
         out_order = out_ids.argsort(dim=-1)
         ref_ids_sorted = ref_ids.gather(1, ref_order)
@@ -243,7 +224,7 @@ class TestFusedRouting:
     def test_empty_tokens(self):
         gating = torch.empty(0, 256, dtype=torch.bfloat16, device="cuda")
         scale = torch.ones(256, dtype=torch.float32, device="cuda")
-        w, ids = torch.ops.sgl_kernel.gemma4_fused_routing.default(gating, scale, 8)
+        w, ids = gemma4_fused_routing(gating, scale, 8)
         assert w.shape == (0, 8)
         assert ids.shape == (0, 8)
 
@@ -255,8 +236,7 @@ class TestFusedRouting:
         topk_logits, topk_ids = torch.topk(logits_f, k=K, dim=-1)
         ref_w = (torch.softmax(topk_logits, dim=-1) * scale[topk_ids]).float()
         ref_ids = topk_ids.int()
-        w, out_ids = torch.ops.sgl_kernel.gemma4_fused_routing.default(gating, scale, K)
-        # Sort by expert_id for tie-agnostic comparison
+        w, out_ids = gemma4_fused_routing(gating, scale, K)
         ref_order = ref_ids.argsort(dim=-1)
         out_order = out_ids.argsort(dim=-1)
         assert (ref_ids.gather(1, ref_order) == out_ids.gather(1, out_order)).all()
