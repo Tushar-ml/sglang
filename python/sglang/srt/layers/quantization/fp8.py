@@ -846,11 +846,11 @@ class Fp8LinearMethod(LinearMethodBase):
 
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
-                    input=x[0],
+                    input=x,
                     weight=layer.weight,
                     block_size=self.quant_config.weight_block_size,
                     weight_scale=layer.weight_scale_inv,
-                    input_scale=x[1],
+                    input_scale=None,
                     bias=bias,
                 )
 

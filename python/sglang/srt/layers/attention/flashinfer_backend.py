@@ -205,13 +205,23 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_dllm_model = self.dllm_config is not None
 
         # Parse constants
+        _full_num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_attention_tp_size(),
-            num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_attention_tp_size()
-            ),
+            num_kv_heads=_full_num_kv_heads,
+        )
+        # SWA layers may use a different num_kv_heads (e.g. Gemma4).
+        self.swa_num_kv_heads = model_runner.model_config.get_swa_num_kv_heads(
+            get_attention_tp_size()
+        )
+        # True when SWA and full-attention layers have different kv head counts.
+        self.has_heterogeneous_kv_heads = (
+            self.swa_num_kv_heads != _full_num_kv_heads
+            and model_runner.sliding_window_size is not None
         )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
@@ -664,6 +674,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     not self.enable_deterministic
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
+                    and not self.has_heterogeneous_kv_heads
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
@@ -1010,6 +1021,8 @@ class FlashInferIndicesUpdaterDecode:
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
+        # For models with different kv_heads on SWA vs full-attention layers (e.g. Gemma4).
+        self.swa_num_kv_heads = attn_backend.swa_num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -1099,12 +1112,14 @@ class FlashInferIndicesUpdaterDecode:
                 else:
                     paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
                 kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
+                wrapper_num_kv_heads = self.swa_num_kv_heads
             else:
                 # Full attention
                 paged_kernel_lens_tmp = seq_lens
                 paged_kernel_lens_sum_tmp = seq_lens_sum
                 seq_lens_cpu_tmp = seq_lens_cpu
                 kv_start_idx_tmp = None
+                wrapper_num_kv_heads = self.num_kv_heads
 
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
@@ -1122,6 +1137,7 @@ class FlashInferIndicesUpdaterDecode:
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                num_kv_heads=wrapper_num_kv_heads,
             )
 
     def update_cross_attention(
@@ -1176,7 +1192,13 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        num_kv_heads: Optional[int] = None,
     ):
+        # Allow per-wrapper kv head count override for models with heterogeneous kv heads
+        # (e.g. Gemma4 where SWA and full-attention layers differ).
+        effective_num_kv_heads = (
+            num_kv_heads if num_kv_heads is not None else self.num_kv_heads
+        )
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1234,7 +1256,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.kv_last_page_len[:bs],
                 self.num_qo_heads,
-                self.num_kv_heads,
+                effective_num_kv_heads,
                 self.head_dim,
                 1,
                 data_type=self.data_type,
@@ -1253,7 +1275,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.kv_last_page_len[:bs],
                 self.num_qo_heads,
-                self.num_kv_heads,
+                effective_num_kv_heads,
                 self.head_dim,
                 1,
                 data_type=self.data_type,
@@ -1278,6 +1300,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
+        # For models with different kv_heads on SWA vs full-attention layers (e.g. Gemma4).
+        self.swa_num_kv_heads = attn_backend.swa_num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -1411,11 +1435,13 @@ class FlashInferIndicesUpdaterPrefill:
                     )
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+                wrapper_num_kv_heads = self.swa_num_kv_heads
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
                 kv_start_idx = seq_lens - paged_kernel_lens
+                wrapper_num_kv_heads = self.num_kv_heads
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
             )
@@ -1437,6 +1463,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                num_kv_heads=wrapper_num_kv_heads,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1545,7 +1572,13 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        num_kv_heads: Optional[int] = None,
     ):
+        # Allow per-wrapper kv head count override for models with heterogeneous kv heads
+        # (e.g. Gemma4 where SWA and full-attention layers differ).
+        effective_num_kv_heads = (
+            num_kv_heads if num_kv_heads is not None else self.num_kv_heads
+        )
         bs = len(seq_lens)
         if spec_info is None:
             assert prefix_lens is not None
@@ -1599,7 +1632,7 @@ class FlashInferIndicesUpdaterPrefill:
                 qo_indptr,
                 qo_indptr,
                 self.num_qo_heads,
-                self.num_kv_heads,
+                effective_num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
@@ -1636,7 +1669,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
-            self.num_kv_heads,
+            effective_num_kv_heads,
             self.head_dim,
             1,
             q_data_type=self.q_data_type,

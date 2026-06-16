@@ -657,7 +657,7 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 
 
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
-    input: torch.Tensor,
+    input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,
     block_size: List[int],
     weight_scale: torch.Tensor,
@@ -665,6 +665,24 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert input_scale is None
+
+    # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
+    if isinstance(input, tuple):
+        q_input, x_scale = input
+        q_input = q_input.view(-1, q_input.shape[-1])
+        output_shape = [*q_input.shape[:-1], weight.shape[0]]
+        output_dtype = torch.bfloat16
+        output = w8a8_block_fp8_matmul_deepgemm(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return output.to(dtype=output_dtype).view(*output_shape)
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16

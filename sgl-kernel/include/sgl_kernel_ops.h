@@ -122,6 +122,40 @@ void musa_fused_add_rms_norm(
     torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
+void rmsnorm_per_block_fp8_quant(
+    at::Tensor output_q,
+    at::Tensor output_s,
+    at::Tensor input,
+    at::Tensor weight,
+    double eps,
+    int64_t group_size,
+    bool scale_ue8m0);
+void fused_add_rmsnorm_per_block_fp8_quant(
+    at::Tensor output_q,
+    at::Tensor output_s,
+    at::Tensor input,
+    at::Tensor residual,
+    at::Tensor weight,
+    double eps,
+    int64_t group_size,
+    bool scale_ue8m0);
+void gemma_rmsnorm_per_block_fp8_quant(
+    at::Tensor output_q,
+    at::Tensor output_s,
+    at::Tensor input,
+    at::Tensor weight,
+    double eps,
+    int64_t group_size,
+    bool scale_ue8m0);
+void gemma_fused_add_rmsnorm_per_block_fp8_quant(
+    at::Tensor output_q,
+    at::Tensor output_s,
+    at::Tensor input,
+    at::Tensor residual,
+    at::Tensor weight,
+    double eps,
+    int64_t group_size,
+    bool scale_ue8m0);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);

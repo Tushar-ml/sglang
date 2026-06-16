@@ -75,6 +75,26 @@ def _toggle_multi_platform_ops(
             _toggle_multi_platform_ops(sub, reverse=reverse, num_tokens=num_tokens)
 
 
+def _resolve_piecewise_compile_target(
+    language_model: torch.nn.Module,
+) -> torch.nn.Module:
+    """Return the submodule whose forward is wrapped by piecewise compile.
+
+    Most wrappers use ``language_model.model`` (e.g. Qwen2-VL). Gemma4TextModel
+    and similar text backbones expose ``.layers`` directly without a nested
+    ``.model``.
+    """
+    inner = getattr(language_model, "model", None)
+    if inner is not None and hasattr(inner, "layers"):
+        return inner
+    if hasattr(language_model, "layers"):
+        return language_model
+    raise AttributeError(
+        f"{language_model.__class__.__name__} has no piecewise compile target "
+        "(expected .model.layers or .layers)"
+    )
+
+
 class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     """torch.compile-driven piecewise capture; attention metadata
     recomputed at replay outside the compiled callable's sub-graphs.
@@ -92,6 +112,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._language_model: torch.nn.Module = getattr(
             model_runner.model, "language_model", model_runner.model
         )
+        self._compile_target = _resolve_piecewise_compile_target(self._language_model)
         self._run_compile_pass(cuda_graph_runner)
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
@@ -123,16 +144,16 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     @staticmethod
     def install_compile(
-        language_model: Any,
+        compile_module: Any,
         *,
         compile_config: CompilationConfig,
         graph_pool: Any,
         fullgraph: bool = True,
         dynamic_arg_dims: Optional[Any] = None,
     ) -> None:
-        """Wrap language_model.model.forward with torch.compile."""
+        """Wrap the text backbone forward with torch.compile."""
         install_torch_compiled(
-            language_model,
+            compile_module,
             fullgraph=fullgraph,
             dynamic_arg_dims=dynamic_arg_dims,
             compile_config=compile_config,
@@ -145,12 +166,13 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         enable_torch_compile_warmup to drive FX / inductor through
         every shape without capturing cuda graphs yet."""
         language_model = self._language_model
+        compile_target = self._compile_target
         compiler = self._compile_config.compiler
         with enable_tc_piecewise_cuda_graph():
             try:
                 if compiler != "eager":
                     _toggle_multi_platform_ops(
-                        language_model.model, reverse=False, num_tokens=16
+                        compile_target, reverse=False, num_tokens=16
                     )
 
                 cuda_graph_runner._run_dummy_forward(
@@ -162,7 +184,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 set_graph_pool_id(self._pool)
 
                 self.install_compile(
-                    language_model.model,
+                    compile_target,
                     compile_config=self._compile_config,
                     graph_pool=self._pool,
                 )
@@ -191,9 +213,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
             finally:
-                _toggle_multi_platform_ops(
-                    language_model.model, reverse=True, num_tokens=16
-                )
+                _toggle_multi_platform_ops(compile_target, reverse=True, num_tokens=16)
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
