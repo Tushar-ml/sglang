@@ -47,6 +47,11 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_fused_norm import (
+    fused_add_rmsnorm_per_block_fp8_quant,
+    rmsnorm_per_block_fp8_quant,
+    use_gemma4_fused_norm_fp8_quant,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -411,9 +416,12 @@ class Gemma4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        qkv_input: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         **kwargs,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(qkv_input if qkv_input is not None else hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
@@ -637,6 +645,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
+        self._use_fused_norm_fp8 = use_gemma4_fused_norm_fp8_quant(quant_config)
         self.prefix = prefix
 
     def forward(
@@ -659,13 +668,27 @@ class Gemma4DecoderLayer(nn.Module):
         #   residual = h + residual (in-place)
         #   h = gemma_norm(residual)
         residual = hidden_states
+        use_fused_norm_fp8 = (
+            self._use_fused_norm_fp8
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 2
+        )
 
-        # Apply input layernorm
-        hidden_states = self.input_layernorm(hidden_states)
+        if use_fused_norm_fp8:
+            qkv_in = rmsnorm_per_block_fp8_quant(
+                hidden_states,
+                self.input_layernorm.weight.data,
+                self.input_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+            qkv_in = None
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            qkv_input=qkv_in,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -716,11 +739,21 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
-            hidden_states = self.mlp(hidden_states)
+            if use_fused_norm_fp8:
+                mlp_in = fused_add_rmsnorm_per_block_fp8_quant(
+                    hidden_states,
+                    residual,
+                    self.pre_feedforward_layernorm.weight.data,
+                    self.pre_feedforward_layernorm.variance_epsilon,
+                )
+                residual = hidden_states + residual
+                hidden_states = self.mlp(mlp_in)
+            else:
+                # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
+                hidden_states = self.mlp(hidden_states)
 
         if (
             not self.has_ple

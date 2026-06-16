@@ -64,6 +64,26 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
+  m.def(
+      "rmsnorm_per_block_fp8_quant(Tensor! output_q, Tensor! output_s, Tensor input, Tensor weight, float eps, int "
+      "group_size, bool scale_ue8m0) -> ()");
+  m.impl("rmsnorm_per_block_fp8_quant", torch::kCUDA, &rmsnorm_per_block_fp8_quant);
+
+  m.def(
+      "fused_add_rmsnorm_per_block_fp8_quant(Tensor! output_q, Tensor! output_s, Tensor input, Tensor residual, Tensor "
+      "weight, float eps, int group_size, bool scale_ue8m0) -> ()");
+  m.impl("fused_add_rmsnorm_per_block_fp8_quant", torch::kCUDA, &fused_add_rmsnorm_per_block_fp8_quant);
+
+  m.def(
+      "gemma_rmsnorm_per_block_fp8_quant(Tensor! output_q, Tensor! output_s, Tensor input, Tensor weight, float eps, "
+      "int group_size, bool scale_ue8m0) -> ()");
+  m.impl("gemma_rmsnorm_per_block_fp8_quant", torch::kCUDA, &gemma_rmsnorm_per_block_fp8_quant);
+
+  m.def(
+      "gemma_fused_add_rmsnorm_per_block_fp8_quant(Tensor! output_q, Tensor! output_s, Tensor input, Tensor residual, "
+      "Tensor weight, float eps, int group_size, bool scale_ue8m0) -> ()");
+  m.impl("gemma_fused_add_rmsnorm_per_block_fp8_quant", torch::kCUDA, &gemma_fused_add_rmsnorm_per_block_fp8_quant);
+
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
