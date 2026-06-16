@@ -8,9 +8,19 @@ from sglang.kernel_api_logging import debug_kernel_api
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
-except Exception as _e:  # pragma: no cover
-    _flash_attn_varlen_func = None
-    _flash_attn_import_error = _e
+except Exception:  # pragma: no cover
+    try:
+        # Fall back to the CuTe kernels vendored inside SGLang (Apache-2.0,
+        # adapted from vllm-project/vllm).  This path avoids requiring flash_attn
+        # to ship flash_attn.cute and removes the runtime patching step.
+        from sglang.jit_kernel.flash_attn_cute import (
+            flash_attn_varlen_func as _flash_attn_varlen_func,
+        )
+
+        _flash_attn_import_error = None
+    except Exception as _e:
+        _flash_attn_varlen_func = None
+        _flash_attn_import_error = _e
 else:
     _flash_attn_import_error = None
 
@@ -45,8 +55,9 @@ def flash_attn_varlen_func(
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
-            "Vendored FlashAttention CUTE is not available (cannot import "
-            "flash_attn.cute). Please check your source tree."
+            "FlashAttention CUTE (FA4) is not available. Neither flash_attn.cute "
+            "nor sglang.jit_kernel.flash_attn_cute could be imported. "
+            "Install quack-kernels: pip install quack-kernels"
         ) from _flash_attn_import_error
 
     q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
