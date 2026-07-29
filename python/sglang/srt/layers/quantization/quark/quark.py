@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
+    QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -80,6 +81,7 @@ class QuarkConfig(QuantizationConfig):
         if quant_config is None:
             raise ValueError("Either quant_config or online_scheme must be provided")
 
+        self.online_scheme = online_scheme
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
@@ -88,20 +90,30 @@ class QuarkConfig(QuantizationConfig):
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
-        self._quantized_layers = set()
+        self._online_quantized_layers = set()
 
         if isinstance(self.dequantization_config, Fp8Config):
             self.weight_block_size = self.dequantization_config.weight_block_size
 
-    @property
-    def quantized_layers(self) -> tuple[dict[str, int], int]:
+    def log_online_quantization(self) -> None:
+        """
+        Log which layers are using online quantization, as well as a count for each layer type.
+        """
         # Count layers per type (last two parts after ".")
         type_counts: dict[str, int] = {}
-        for name in self._quantized_layers:
+        for name in self._online_quantized_layers:
             parts = name.split(".")
             layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
             type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
-        return dict(sorted(type_counts.items())), len(self._quantized_layers)
+
+        type_counts = dict(sorted(type_counts.items()))
+        count = len(self._online_quantized_layers)
+
+        type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
+        logger.info_once(
+            f"Online {self.online_scheme} quantization: "
+            f"quantized {count} layers in total ({type_summary})."
+        )
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -149,17 +161,17 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             return QuarkLinearMethod(self)
 
         if isinstance(layer, RadixAttention):
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return QuarkFusedMoEMethod(self)
 
@@ -185,6 +197,7 @@ class QuarkConfig(QuantizationConfig):
                     hf_config=hf_config,
                     is_prequantized=False,
                     dequantization_config=dequantization_config,
+                    online_scheme=config["requantization_method"],
                 )
             else:
                 raise NotImplementedError(
@@ -341,10 +354,12 @@ class QuarkConfig(QuantizationConfig):
 
             supported = capability >= min_capability
             if error and not supported:
+                # Pass a single joined message; RuntimeError stringifies
+                # multiple positional args as a tuple repr.
                 raise RuntimeError(
-                    "Quantization scheme is not supported for ",
-                    f"the current GPU. Min capability: {min_capability}. ",
-                    f"Current capability: {capability}.",
+                    "Quantization scheme is not supported for "
+                    f"the current GPU. Min capability: {min_capability}. "
+                    f"Current capability: {capability}."
                 )
             return supported
         else:
@@ -432,6 +447,28 @@ class QuarkConfig(QuantizationConfig):
 
         return True
 
+    def _is_mx_w4a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_mx_fp4_weight = (
+            weight_quant.get("dtype") == "fp4"
+            and weight_quant.get("qscheme") == "per_group"
+            and weight_quant.get("group_size") == 32
+            and not weight_quant.get("is_dynamic")
+            and weight_quant.get("scale_format") == "e8m0"
+        )
+        is_static_fp8_activation = (
+            input_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and input_quant.get("qscheme") == "per_tensor"
+            and not input_quant.get("is_dynamic")
+        )
+        return is_mx_fp4_weight and is_static_fp8_activation
+
     def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
@@ -454,7 +491,7 @@ class QuarkConfig(QuantizationConfig):
             ):
                 raise ValueError(
                     f"Found a different quantization configuration for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
             return shard_configs[0]
@@ -545,6 +582,9 @@ class QuarkConfig(QuantizationConfig):
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
                 dequantization_config=self.dequantization_config,
             )
+        elif self._is_mx_w4a8(weight_config, input_config):
+            logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
+            return QuarkW4A8MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
@@ -594,6 +634,9 @@ class QuarkLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+        if self.quantization_config.online_scheme is not None:
+            self.quantization_config.log_online_quantization()
 
     def create_weights(
         self,
@@ -646,6 +689,9 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+        if self.quantization_config.online_scheme is not None:
+            self.quantization_config.log_online_quantization()
 
     def create_weights(
         self,
