@@ -992,6 +992,7 @@ class Scheduler(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"decode_first_schedule={self.server_args.enable_decode_first_schedule}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
@@ -1063,10 +1064,25 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self.enable_decode_first_schedule = (
+            self.server_args.enable_decode_first_schedule
+        )
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
-            and self.server_args.enable_mixed_chunk
+            and (
+                self.server_args.enable_mixed_chunk
+                or self.enable_decode_first_schedule
+            )
         )
+        if (
+            self.enable_decode_first_schedule
+            and self.chunked_prefill_size is None
+            and self.ps.tp_rank == 0
+        ):
+            logger.warning(
+                "Decode-first scheduling is enabled but chunked prefill is disabled; "
+                "prefill steps may still be large."
+            )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -2906,6 +2922,12 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _get_decode_first_stride(self) -> int:
+        stride = getattr(self.server_args, "speculative_num_draft_tokens", None)
+        if stride is None or stride <= 0:
+            return 1
+        return stride
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2975,6 +2997,32 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        decode_first_enabled = (
+            self.enable_decode_first_schedule and not running_batch.is_empty()
+        )
+        decode_token_cost = 0
+        if decode_first_enabled:
+            has_waiting_logprob = any(req.return_logprob for req in self.waiting_queue)
+            has_waiting_embeds = any(
+                req.input_embeds is not None for req in self.waiting_queue
+            )
+            has_chunked_embeds = (
+                self.chunked_req is not None and self.chunked_req.input_embeds is not None
+            )
+            # Decode-first mode requires mixed prefill+decode. If mixing is unsupported for
+            # this iteration, run decode only and keep waiting requests queued.
+            if (
+                getattr(running_batch, "return_logprob", False)
+                or has_waiting_logprob
+                or has_waiting_embeds
+                or has_chunked_embeds
+            ):
+                return None, running_batch
+
+            decode_token_cost = running_bs * self._get_decode_first_stride()
+            if decode_token_cost >= self.max_prefill_tokens:
+                return None, running_batch
+
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
 
@@ -2991,6 +3039,14 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        if decode_first_enabled:
+            residual_prefill_budget = self.max_prefill_tokens - decode_token_cost
+            if chunked_prefill_size is None:
+                chunked_prefill_size = residual_prefill_budget
+            else:
+                chunked_prefill_size = min(
+                    chunked_prefill_size, residual_prefill_budget
+                )
 
         # Prefill policy
         adder = PrefillAdder(
@@ -3001,7 +3057,9 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            decode_token_cost
+            if decode_first_enabled
+            else (running_bs if self.is_mixed_chunk else 0),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
@@ -3169,7 +3227,7 @@ class Scheduler(
 
         # Mixed-style chunked prefill
         if (
-            self.is_mixed_chunk
+            (self.is_mixed_chunk or self.enable_decode_first_schedule)
             and not running_batch.is_empty()
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch

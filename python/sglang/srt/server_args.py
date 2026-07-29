@@ -943,6 +943,11 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    enable_decode_first_schedule: A[
+        bool,
+        "Enable decode-first scheduling. Running decode tokens are budgeted first, and prefill uses only residual per-step budget.",
+        NS("schedule"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
