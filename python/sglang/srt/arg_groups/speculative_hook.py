@@ -553,10 +553,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
-        )
+        if server_args.enable_decode_first_schedule:
+            logger.warning(
+                "Disabling --enable-mixed-chunk for eagle speculative decoding; "
+                "decode-first scheduling will still mix via 1-token-per-req decode allocation."
+            )
+        else:
+            logger.warning(
+                "Mixed chunked prefill is disabled because of using "
+                "eagle speculative decoding."
+            )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]
     if model_arch in [

@@ -98,7 +98,8 @@ class TestDecodeFirstScheduling(CustomTestCase):
         s.enable_hicache_storage = False
         s.truncation_align_size = 0
         s.enable_decode_first_schedule = True
-        s.is_mixed_chunk = False
+        # Decode-first residual budgeting only runs when mixing is allowed.
+        s.is_mixed_chunk = True
         return s
 
     def test_decode_first_uses_residual_budget_for_prefill_adder(self):

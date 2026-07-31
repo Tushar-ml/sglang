@@ -1067,22 +1067,23 @@ class Scheduler(
         self.enable_decode_first_schedule = (
             self.server_args.enable_decode_first_schedule
         )
-        self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None
-            and (
-                self.server_args.enable_mixed_chunk
-                or self.enable_decode_first_schedule
-            )
+        # Decode-first residual budgeting needs a mixed prefill+decode step.
+        # EAGLE/spec force-disable enable_mixed_chunk, but decode-first still
+        # mixes via prepare_for_mix_decode (1 token/req, not speculative over-alloc).
+        self.is_mixed_chunk = self.chunked_prefill_size is not None and (
+            self.server_args.enable_mixed_chunk or self.enable_decode_first_schedule
         )
-        if (
-            self.enable_decode_first_schedule
-            and self.chunked_prefill_size is None
-            and self.ps.tp_rank == 0
-        ):
-            logger.warning(
-                "Decode-first scheduling is enabled but chunked prefill is disabled; "
-                "prefill steps may still be large."
-            )
+        if self.enable_decode_first_schedule and self.ps.tp_rank == 0:
+            if self.chunked_prefill_size is None:
+                logger.warning(
+                    "Decode-first scheduling is enabled but chunked prefill is disabled; "
+                    "prefill steps may still be large."
+                )
+            elif not self.spec_algorithm.is_none():
+                logger.info(
+                    "Decode-first scheduling with speculative decoding: mixing uses "
+                    "1-token-per-req decode allocation (not speculative over-alloc)."
+                )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -3009,8 +3010,8 @@ class Scheduler(
             has_chunked_embeds = (
                 self.chunked_req is not None and self.chunked_req.input_embeds is not None
             )
-            # Decode-first mode requires mixed prefill+decode. If mixing is unsupported for
-            # this iteration, run decode only and keep waiting requests queued.
+            # Decode-first mode requires mixed prefill+decode. If mixing is unsupported
+            # for this iteration (logprob / embeds), run decode only and keep waiting queued.
             if (
                 getattr(running_batch, "return_logprob", False)
                 or has_waiting_logprob
@@ -3227,7 +3228,7 @@ class Scheduler(
 
         # Mixed-style chunked prefill
         if (
-            (self.is_mixed_chunk or self.enable_decode_first_schedule)
+            self.is_mixed_chunk
             and not running_batch.is_empty()
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
@@ -3236,7 +3237,9 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
-                running_batch.prepare_for_decode()
+                # Use mix-safe 1-token/req alloc. Spec prepare_for_decode over-allocates
+                # draft KV pages and breaks mix_with_running's extend_num_tokens contract.
+                running_batch.prepare_for_mix_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
             running_batch = ScheduleBatch(
