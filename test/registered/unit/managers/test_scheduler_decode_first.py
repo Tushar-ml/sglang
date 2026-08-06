@@ -2,7 +2,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -165,6 +168,48 @@ class TestDecodeFirstScheduling(CustomTestCase):
         self.assertEqual(rem_input_tokens, 100)
         self.assertEqual(num_mixed_decode_tokens, 0)
         self.assertEqual(rem_chunk_tokens, 90)
+
+    def test_mix_decode_spec_never_allocates_below_live_seq_len(self):
+        req = SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=64),
+            decode_batch_idx=0,
+            kv_committed_len=70,
+        )
+        # kv_allocated_len intentionally lags seq_lens to exercise the floor.
+        batch = SimpleNamespace(
+            sampling_info=SimpleNamespace(
+                penalizer_orchestrator=SimpleNamespace(is_required=False)
+            ),
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+            reqs=[req],
+            seq_lens_cpu=torch.tensor([70], dtype=torch.int32),
+            seq_lens=torch.tensor([70], dtype=torch.int64),
+            orig_seq_lens=torch.tensor([70], dtype=torch.int64),
+            device=torch.device("cpu"),
+            tree_cache=object(),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(0, 512, dtype=torch.int64).view(1, 512)
+            ),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int32),
+            hisparse_coordinator=None,
+            spec_info=object(),
+        )
+
+        with patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_spec_decode"
+        ) as alloc_mock:
+            alloc_mock.return_value = None
+            ScheduleBatch._prepare_for_mix_decode_reusing_spec_kv(
+                batch, SimpleNamespace(enable_mamba_extra_buffer=lambda: False)
+            )
+
+        _, kwargs = alloc_mock.call_args
+        # Start from live seq_lens clock (70), not stale kv_allocated_len=64.
+        self.assertEqual(int(kwargs["cur_kv_lens_cpu"][0].item()), 70)
+        self.assertEqual(int(kwargs["nxt_kv_lens_cpu"][0].item()), 128)
+        self.assertEqual(req.kv.kv_allocated_len, 128)
 
 
 if __name__ == "__main__":

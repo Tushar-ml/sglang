@@ -556,7 +556,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         if server_args.enable_decode_first_schedule:
             logger.warning(
                 "Disabling --enable-mixed-chunk for eagle speculative decoding; "
-                "decode-first scheduling will still mix via 1-token-per-req decode allocation."
+                "decode-first scheduling may disable mixed prefill+decode on "
+                "paged-KV setups for safety."
             )
         else:
             logger.warning(

@@ -1067,17 +1067,28 @@ class Scheduler(
         self.enable_decode_first_schedule = (
             self.server_args.enable_decode_first_schedule
         )
-        # Decode-first residual budgeting needs a mixed prefill+decode step.
-        # EAGLE/spec force-disable enable_mixed_chunk, but decode-first still
-        # mixes via prepare_for_mix_decode (1 token/req, not speculative over-alloc).
+        decode_first_mix_safe = not (
+            self.enable_decode_first_schedule
+            and not self.spec_algorithm.is_none()
+            and self.page_size > 1
+        )
+        # Decode-first budget accounting stays enabled even when we disable
+        # mixed prefill+decode execution for unsafe speculative paged-KV configs.
         self.is_mixed_chunk = self.chunked_prefill_size is not None and (
-            self.server_args.enable_mixed_chunk or self.enable_decode_first_schedule
+            self.server_args.enable_mixed_chunk
+            or (self.enable_decode_first_schedule and decode_first_mix_safe)
         )
         if self.enable_decode_first_schedule and self.ps.tp_rank == 0:
             if self.chunked_prefill_size is None:
                 logger.warning(
                     "Decode-first scheduling is enabled but chunked prefill is disabled; "
                     "prefill steps may still be large."
+                )
+            elif not self.spec_algorithm.is_none() and not decode_first_mix_safe:
+                logger.warning(
+                    "Decode-first scheduling is enabled with speculative paged KV "
+                    "(page_size>1): disabling mixed prefill+decode execution to "
+                    "avoid unstable KV ownership accounting."
                 )
             elif not self.spec_algorithm.is_none():
                 logger.info(

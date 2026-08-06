@@ -1484,11 +1484,36 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
+        max_new = self.sampling_params.max_new_tokens
+        overshoot = max(0, len(self.output_ids) - max_new)
+        # Speculative decoding can accept a chunk that both crosses
+        # max_new_tokens and contains EOS (GLM user-role token). Checking
+        # length first would FINISH_LENGTH with the EOS still in the visible
+        # prefix; tool/reasoning paths keep skip_special_tokens=False, so that
+        # token leaks into streamed content. Restrict stop checks to the
+        # client-visible prefix, then fall back to length.
+        visible_accepted_len = max(0, new_accepted_len - overshoot)
+        if overshoot:
+            full_output_ids = self.output_ids
+            self.output_ids = self.output_ids[:max_new]
+            try:
+                if visible_accepted_len:
+                    visible_tokens = self.output_ids[-visible_accepted_len:]
+                    if self._check_vocab_boundary_finish(visible_tokens):
+                        return
+                    if self._check_str_based_finish(visible_accepted_len):
+                        return
+                    if self._check_token_based_finish(visible_tokens):
+                        return
+                if self.grammar is not None and self.grammar.is_terminated():
+                    self.finished_reason = FINISH_MATCHED_TOKEN(
+                        matched=self.output_ids[-1]
+                    )
+                    return
+                self.finished_reason = FINISH_LENGTH(length=max_new)
+                self.finished_len = max_new
+            finally:
+                self.output_ids = full_output_ids
             return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
@@ -2907,10 +2932,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cur_list: list[int] = []
         nxt_list: list[int] = []
         num_needed = 0
+        # Overlap/spec can leave seq_lens behind per-request committed clock.
+        # Mixed decode writes by seq_lens position; align the clock first so we
+        # never reuse an already-committed slot.
+        committed_lens_cpu = torch.tensor(
+            [
+                int(req.kv_committed_len) if req.kv is not None else int(self.seq_lens_cpu[i].item())
+                for i, req in enumerate(self.reqs)
+            ],
+            dtype=self.seq_lens_cpu.dtype,
+        )
+        if torch.any(committed_lens_cpu > self.seq_lens_cpu):
+            self.seq_lens_cpu = torch.maximum(self.seq_lens_cpu, committed_lens_cpu)
+            committed_lens = committed_lens_cpu.to(device=self.device, non_blocking=True)
+            self.seq_lens = torch.maximum(self.seq_lens, committed_lens.to(dtype=self.seq_lens.dtype))
+            self.orig_seq_lens = torch.maximum(
+                self.orig_seq_lens, committed_lens.to(dtype=self.orig_seq_lens.dtype)
+            )
+
         for i, req in enumerate(self.reqs):
             cur = int(req.kv.kv_allocated_len) if req.kv is not None else 0
+            seq = int(self.seq_lens_cpu[i].item())
+            # Never write from below current decode position; that can overwrite
+            # already-owned req_to_token entries and cause double-frees later.
+            cur = max(cur, seq)
             # Write position for this decode step is current seq_lens[i].
-            need = int(self.seq_lens_cpu[i].item()) + 1
+            need = seq + 1
             if page_size > 1:
                 need = ceil_align(need, page_size)
             nxt = max(cur, need)
