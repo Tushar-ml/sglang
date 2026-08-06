@@ -992,6 +992,7 @@ class Scheduler(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"decode_first_schedule={self.server_args.enable_decode_first_schedule}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
@@ -1063,10 +1064,37 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None
-            and self.server_args.enable_mixed_chunk
+        self.enable_decode_first_schedule = (
+            self.server_args.enable_decode_first_schedule
         )
+        decode_first_mix_safe = not (
+            self.enable_decode_first_schedule
+            and not self.spec_algorithm.is_none()
+            and self.page_size > 1
+        )
+        # Decode-first budget accounting stays enabled even when we disable
+        # mixed prefill+decode execution for unsafe speculative paged-KV configs.
+        self.is_mixed_chunk = self.chunked_prefill_size is not None and (
+            self.server_args.enable_mixed_chunk
+            or (self.enable_decode_first_schedule and decode_first_mix_safe)
+        )
+        if self.enable_decode_first_schedule and self.ps.tp_rank == 0:
+            if self.chunked_prefill_size is None:
+                logger.warning(
+                    "Decode-first scheduling is enabled but chunked prefill is disabled; "
+                    "prefill steps may still be large."
+                )
+            elif not self.spec_algorithm.is_none() and not decode_first_mix_safe:
+                logger.warning(
+                    "Decode-first scheduling is enabled with speculative paged KV "
+                    "(page_size>1): disabling mixed prefill+decode execution to "
+                    "avoid unstable KV ownership accounting."
+                )
+            elif not self.spec_algorithm.is_none():
+                logger.info(
+                    "Decode-first scheduling with speculative decoding: mixing uses "
+                    "1-token-per-req decode allocation (not speculative over-alloc)."
+                )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -2906,6 +2934,12 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _get_decode_first_stride(self) -> int:
+        stride = getattr(self.server_args, "speculative_num_draft_tokens", None)
+        if stride is None or stride <= 0:
+            return 1
+        return stride
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2975,6 +3009,32 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        decode_first_enabled = (
+            self.enable_decode_first_schedule and not running_batch.is_empty()
+        )
+        decode_token_cost = 0
+        if decode_first_enabled:
+            has_waiting_logprob = any(req.return_logprob for req in self.waiting_queue)
+            has_waiting_embeds = any(
+                req.input_embeds is not None for req in self.waiting_queue
+            )
+            has_chunked_embeds = (
+                self.chunked_req is not None and self.chunked_req.input_embeds is not None
+            )
+            # Decode-first mode requires mixed prefill+decode. If mixing is unsupported
+            # for this iteration (logprob / embeds), run decode only and keep waiting queued.
+            if (
+                getattr(running_batch, "return_logprob", False)
+                or has_waiting_logprob
+                or has_waiting_embeds
+                or has_chunked_embeds
+            ):
+                return None, running_batch
+
+            decode_token_cost = running_bs * self._get_decode_first_stride()
+            if decode_token_cost >= self.max_prefill_tokens:
+                return None, running_batch
+
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
 
@@ -2991,6 +3051,14 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        if decode_first_enabled:
+            residual_prefill_budget = self.max_prefill_tokens - decode_token_cost
+            if chunked_prefill_size is None:
+                chunked_prefill_size = residual_prefill_budget
+            else:
+                chunked_prefill_size = min(
+                    chunked_prefill_size, residual_prefill_budget
+                )
 
         # Prefill policy
         adder = PrefillAdder(
@@ -3001,7 +3069,9 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            decode_token_cost
+            if decode_first_enabled
+            else (running_bs if self.is_mixed_chunk else 0),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
@@ -3178,7 +3248,9 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
-                running_batch.prepare_for_decode()
+                # Use mix-safe 1-token/req alloc. Spec prepare_for_decode over-allocates
+                # draft KV pages and breaks mix_with_running's extend_num_tokens contract.
+                running_batch.prepare_for_mix_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
             running_batch = ScheduleBatch(

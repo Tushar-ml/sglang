@@ -80,6 +80,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
+    alloc_for_spec_decode,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1483,11 +1484,36 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
+        max_new = self.sampling_params.max_new_tokens
+        overshoot = max(0, len(self.output_ids) - max_new)
+        # Speculative decoding can accept a chunk that both crosses
+        # max_new_tokens and contains EOS (GLM user-role token). Checking
+        # length first would FINISH_LENGTH with the EOS still in the visible
+        # prefix; tool/reasoning paths keep skip_special_tokens=False, so that
+        # token leaks into streamed content. Restrict stop checks to the
+        # client-visible prefix, then fall back to length.
+        visible_accepted_len = max(0, new_accepted_len - overshoot)
+        if overshoot:
+            full_output_ids = self.output_ids
+            self.output_ids = self.output_ids[:max_new]
+            try:
+                if visible_accepted_len:
+                    visible_tokens = self.output_ids[-visible_accepted_len:]
+                    if self._check_vocab_boundary_finish(visible_tokens):
+                        return
+                    if self._check_str_based_finish(visible_accepted_len):
+                        return
+                    if self._check_token_based_finish(visible_tokens):
+                        return
+                if self.grammar is not None and self.grammar.is_terminated():
+                    self.finished_reason = FINISH_MATCHED_TOKEN(
+                        matched=self.output_ids[-1]
+                    )
+                    return
+                self.finished_reason = FINISH_LENGTH(length=max_new)
+                self.finished_len = max_new
+            finally:
+                self.output_ids = full_output_ids
             return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
@@ -2861,6 +2887,142 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_prepare_for_decode(self)
             return
 
+        self._prepare_for_decode_one_token(server_args)
+
+    def prepare_for_mix_decode(self):
+        """Allocate exactly 1 KV token per req for mixing into a MIXED extend batch.
+
+        ``prepare_for_decode`` under EAGLE/spec over-allocates draft KV pages, so
+        ``out_cache_loc.shape[0]`` no longer equals ``batch_size``. ``mix_with_running``
+        only adds ``running_bs`` to ``extend_num_tokens``, so that mismatch blows up
+        later in ``prepare_mlp_sync_batch`` padding. Mixed decode is always a 1-token
+        extend per running req, speculative or not.
+
+        For speculative batches, reuse already-allocated draft pages instead of
+        ``alloc_for_decode``: paged ``alloc_for_decode`` can allocate a fresh page and
+        overwrite ``req_to_token`` entries that still reference prior speculative
+        pages, orphaning a page (pool invariant fail on idle).
+        """
+        self.forward_mode = ForwardMode.DECODE
+        server_args = get_server_args()
+        self.input_embeds = None
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+        # Stale draft verify tensors must not leak into the mixed extend forward;
+        # eagle's extend path rebuilds draft state via draft_extend_for_prefill.
+        self.spec_info = None
+        # Overlap / sync-free EAGLE decode drops seq_lens_cpu; allocation still
+        # needs a CPU mirror for page accounting.
+        if self.seq_lens_cpu is None:
+            self.seq_lens_cpu = self.seq_lens.to("cpu", non_blocking=False)
+
+        if not self.spec_algorithm.is_none():
+            self._prepare_for_mix_decode_reusing_spec_kv(server_args)
+        else:
+            self._prepare_for_decode_one_token(server_args)
+
+    def _prepare_for_mix_decode_reusing_spec_kv(self, server_args):
+        """Ensure capacity for seq_len+1 via eagle-style alloc, then take 1 slot."""
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            self.cumulate_penalty_output_tokens()
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_decode()
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        cur_list: list[int] = []
+        nxt_list: list[int] = []
+        num_needed = 0
+        # Overlap/spec can leave seq_lens behind per-request committed clock.
+        # Mixed decode writes by seq_lens position; align the clock first so we
+        # never reuse an already-committed slot.
+        committed_lens_cpu = torch.tensor(
+            [
+                int(req.kv_committed_len) if req.kv is not None else int(self.seq_lens_cpu[i].item())
+                for i, req in enumerate(self.reqs)
+            ],
+            dtype=self.seq_lens_cpu.dtype,
+        )
+        if torch.any(committed_lens_cpu > self.seq_lens_cpu):
+            self.seq_lens_cpu = torch.maximum(self.seq_lens_cpu, committed_lens_cpu)
+            committed_lens = committed_lens_cpu.to(device=self.device, non_blocking=True)
+            self.seq_lens = torch.maximum(self.seq_lens, committed_lens.to(dtype=self.seq_lens.dtype))
+            self.orig_seq_lens = torch.maximum(
+                self.orig_seq_lens, committed_lens.to(dtype=self.orig_seq_lens.dtype)
+            )
+
+        for i, req in enumerate(self.reqs):
+            cur = int(req.kv.kv_allocated_len) if req.kv is not None else 0
+            seq = int(self.seq_lens_cpu[i].item())
+            # Never write from below current decode position; that can overwrite
+            # already-owned req_to_token entries and cause double-frees later.
+            cur = max(cur, seq)
+            # Write position for this decode step is current seq_lens[i].
+            need = seq + 1
+            if page_size > 1:
+                need = ceil_align(need, page_size)
+            nxt = max(cur, need)
+            cur_list.append(cur)
+            nxt_list.append(nxt)
+            num_needed += nxt - cur
+
+        if num_needed > 0:
+            cur_kv_lens_cpu = torch.tensor(cur_list, dtype=torch.int32)
+            nxt_kv_lens_cpu = torch.tensor(nxt_list, dtype=torch.int32)
+            cur_kv_lens = cur_kv_lens_cpu.to(device=self.device, non_blocking=True)
+            nxt_kv_lens = nxt_kv_lens_cpu.to(device=self.device, non_blocking=True)
+            alloc_for_spec_decode(
+                self.tree_cache,
+                self.req_to_token_pool,
+                reqs=self.reqs,
+                req_pool_indices=self.req_pool_indices,
+                cur_kv_lens=cur_kv_lens,
+                cur_kv_lens_cpu=cur_kv_lens_cpu,
+                nxt_kv_lens=nxt_kv_lens,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed,
+                batch=self,
+            )
+
+        # Reuse the pre-allocated slot at seq_lens (do not page-alloc again).
+        self.out_cache_loc = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices, self.seq_lens
+        ].to(dtype=torch.int64)
+
+        for req in self.reqs:
+            req.decode_batch_idx += 1
+            req.kv_committed_len += 1
+
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        self.orig_seq_lens = self.orig_seq_lens + 1
+        self.seq_lens_sum = None
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
+            )
+
+        if server_args.enable_mamba_extra_buffer():
+            mamba_track_interval = server_args.mamba_track_interval
+            if len(self.reqs) == 0:
+                self.mamba_track_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                )
+            else:
+                if server_args.enable_mamba_extra_buffer_lazy():
+                    self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
+                set_mamba_track_indices_from_reqs(self)
+            self.mamba_track_mask = (
+                (self.seq_lens_cpu % mamba_track_interval == 0)
+                .pin_memory()
+                .to(device=self.device, non_blocking=True)
+            )
+
+    def _prepare_for_decode_one_token(self, server_args):
         if self.sampling_info.penalizer_orchestrator.is_required:
             self.cumulate_penalty_output_tokens()
 
