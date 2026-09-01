@@ -32,11 +32,14 @@ class LlamaEmbeddingModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
+        return_embeds=False,
     ) -> EmbeddingPoolerOutput:
         assert (
             get_embedding
         ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        if return_embeds:
+            return hidden_states
         return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
