@@ -917,6 +917,13 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    enable_decode_first_schedule: A[
+        bool,
+        "Enable decode-first scheduling. Running decode tokens are budgeted first, "
+        "and prefill uses only residual per-step budget. Bounds p99 TTFT under "
+        "concurrency bursts by preventing exclusive mega-prefills from starving decode.",
+        NS("schedule"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
@@ -3821,7 +3828,13 @@ class ServerArgs:
 
     # ===== END TO BE REFACTORED ====
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        # DeepSeek-V4.1-Flash ships a ViT; text-only serve skips it so CP/EP A2A
+        # and KV headroom are available for agentic workloads.
+        "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
+    )
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in

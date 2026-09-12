@@ -353,7 +353,20 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
-        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
+        self.is_lm_only = bool(
+            language_model_only
+            or getattr(self.hf_config, "language_model_only", False)
+        )
+        if (
+            self.is_lm_only
+            and getattr(self.hf_config, "model_type", None) == "deepseek_v41"
+            and int(getattr(self.hf_config, "vision_n_layers", 0) or 0) > 0
+        ):
+            logger.info(
+                "DeepSeek-V4.1 --language-model-only: clearing vision_n_layers "
+                "(skip ViT/aligner; text-only)."
+            )
+            self.hf_config.vision_n_layers = 0
         self.model_is_mrope = (
             not self.is_lm_only
             and rope_scaling is not None

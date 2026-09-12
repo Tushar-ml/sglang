@@ -104,6 +104,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
+    alloc_for_spec_decode,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -3440,6 +3441,209 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.decode_batch_idx for req in self.reqs
             ]
             # async H2D
+            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
+            )
+
+    def prepare_for_mix_decode(self):
+        """Allocate exactly 1 KV token per req for mixing into a MIXED extend batch.
+
+        ``prepare_for_decode`` under speculative decoding over-allocates draft KV
+        pages, so ``out_cache_loc.shape[0]`` no longer equals ``batch_size``.
+        ``mix_with_running`` only adds ``running_bs`` to ``extend_num_tokens``, so
+        that mismatch breaks later padding. Mixed decode is always a 1-token
+        extend per running req, speculative or not.
+
+        For speculative batches, reuse already-allocated draft pages instead of
+        ``alloc_for_decode``: paged ``alloc_for_decode`` can allocate a fresh page
+        and overwrite ``req_to_token`` entries that still reference prior
+        speculative pages, orphaning a page.
+        """
+        self.forward_mode = ForwardMode.DECODE
+        self.input_embeds = None
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+        # Stale draft verify tensors must not leak into the mixed extend forward.
+        self.spec_info = None
+        if self.seq_lens_cpu is None:
+            self.seq_lens_cpu = self.seq_lens.to("cpu", non_blocking=False)
+
+        if not self.spec_algorithm.is_none():
+            self._prepare_for_mix_decode_reusing_spec_kv()
+        else:
+            self._prepare_for_decode_one_token()
+
+    def _prepare_for_mix_decode_reusing_spec_kv(self):
+        """Ensure capacity for seq_len+1 via eagle-style alloc, then take 1 slot."""
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            self.cumulate_penalty_output_tokens()
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_decode()
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        cur_list: list[int] = []
+        nxt_list: list[int] = []
+        num_needed = 0
+        # Overlap/spec can leave seq_lens behind per-request committed clock.
+        # Mixed decode writes by seq_lens position; align the clock first so we
+        # never reuse an already-committed slot.
+        committed_lens_cpu = torch.tensor(
+            [
+                (
+                    int(req.kv.kv_committed_len)
+                    if req.kv is not None
+                    else int(self.seq_lens_cpu[i].item())
+                )
+                for i, req in enumerate(self.reqs)
+            ],
+            dtype=self.seq_lens_cpu.dtype,
+        )
+        if torch.any(committed_lens_cpu > self.seq_lens_cpu):
+            self.seq_lens_cpu = torch.maximum(self.seq_lens_cpu, committed_lens_cpu)
+            committed_lens = committed_lens_cpu.to(device=self.device, non_blocking=True)
+            self.seq_lens = torch.maximum(
+                self.seq_lens, committed_lens.to(dtype=self.seq_lens.dtype)
+            )
+            self.orig_seq_lens = torch.maximum(
+                self.orig_seq_lens, committed_lens.to(dtype=self.orig_seq_lens.dtype)
+            )
+
+        for i, req in enumerate(self.reqs):
+            cur = int(req.kv.kv_allocated_len) if req.kv is not None else 0
+            seq = int(self.seq_lens_cpu[i].item())
+            # Never write from below current decode position; that can overwrite
+            # already-owned req_to_token entries and cause double-frees later.
+            cur = max(cur, seq)
+            need = seq + 1
+            if page_size > 1:
+                need = ceil_align(need, page_size)
+            nxt = max(cur, need)
+            cur_list.append(cur)
+            nxt_list.append(nxt)
+            num_needed += nxt - cur
+
+        if num_needed > 0:
+            cur_kv_lens_cpu = torch.tensor(cur_list, dtype=torch.int32)
+            nxt_kv_lens_cpu = torch.tensor(nxt_list, dtype=torch.int32)
+            cur_kv_lens = cur_kv_lens_cpu.to(device=self.device, non_blocking=True)
+            nxt_kv_lens = nxt_kv_lens_cpu.to(device=self.device, non_blocking=True)
+            alloc_for_spec_decode(
+                self.tree_cache,
+                self.req_to_token_pool,
+                reqs=self.reqs,
+                req_pool_indices=self.req_pool_indices,
+                cur_kv_lens=cur_kv_lens,
+                cur_kv_lens_cpu=cur_kv_lens_cpu,
+                nxt_kv_lens=nxt_kv_lens,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed,
+                batch=self,
+            )
+
+        # Reuse the pre-allocated slot at seq_lens (do not page-alloc again).
+        self.out_cache_loc = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices, self.seq_lens
+        ].to(dtype=torch.int64)
+
+        for req in self.reqs:
+            req.decode_batch_idx += 1
+            req.kv.kv_committed_len += 1
+
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        self.orig_seq_lens = self.orig_seq_lens + 1
+        self.seq_lens_sum = None
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
+            )
+
+        if mamba_extra_buffer_enabled():
+            mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+            if len(self.reqs) == 0:
+                self.mamba_track_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                )
+                self.mamba_track_buffer_indices = []
+            else:
+                if mamba_extra_buffer_lazy_enabled():
+                    self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
+                set_mamba_track_indices_from_reqs(self)
+
+            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_mask_cpu = track_remainders_cpu == 0
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            self.mamba_track_mask_next_cpu = (
+                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                if self.enable_overlap
+                else None
+            )
+            self.mamba_decode_batch_idx_cpu = [
+                req.decode_batch_idx for req in self.reqs
+            ]
+            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
+            )
+
+    def _prepare_for_decode_one_token(self):
+        """Non-spec 1-token decode prep for mixed prefill+decode steps."""
+        strip_beam_tail(self)
+        append_beam_tail(self)
+
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            self.cumulate_penalty_output_tokens()
+
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_decode()
+
+        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
+        for req in self.reqs:
+            req.decode_batch_idx += 1
+
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        self.orig_seq_lens = self.orig_seq_lens + 1
+        self.seq_lens_sum = None
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
+            )
+
+        if mamba_extra_buffer_enabled():
+            mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+
+            if len(self.reqs) == 0:
+                self.mamba_track_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                )
+                self.mamba_track_buffer_indices = []
+            else:
+                if mamba_extra_buffer_lazy_enabled():
+                    self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
+                set_mamba_track_indices_from_reqs(self)
+
+            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_mask_cpu = track_remainders_cpu == 0
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            self.mamba_track_mask_next_cpu = (
+                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                if self.enable_overlap
+                else None
+            )
+            self.mamba_decode_batch_idx_cpu = [
+                req.decode_batch_idx for req in self.reqs
+            ]
             self.mamba_track_mask = track_mask_cpu.pin_memory().to(
                 device=self.device, non_blocking=True
             )

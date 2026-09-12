@@ -4177,14 +4177,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        # --language-model-only (also stamped on hf_config) skips the ViT so
+        # text-only V4.1 can use CP / MoE A2A and free ViT VRAM for KV.
+        skip_vision = bool(getattr(config, "language_model_only", False))
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not skip_vision
+        ):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_pp_group().world_size != 1
                 or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A. "
+                    "For text-only serve with CP/A2A, pass --language-model-only."
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4193,6 +4201,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+        elif (
+            config.model_type == "deepseek_v41"
+            and skip_vision
+            and int(getattr(config, "vision_n_layers", 0) or 0) > 0
+        ):
+            log_info_on_rank0(
+                logger,
+                "DeepSeek-V4.1: --language-model-only set; skipping vision tower "
+                f"(vision_n_layers={config.vision_n_layers}).",
+            )
+            config.vision_n_layers = 0
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )

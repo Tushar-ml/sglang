@@ -842,11 +842,19 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "_handle_eagle_family",
             enable_mixed_chunk=False,
         )
-        logger.warning(
-            "Mixed chunked prefill is disabled: %s speculative decoding does "
-            "not support it.",
-            cfg.speculative_algorithm,
-        )
+        if cfg.enable_decode_first_schedule:
+            logger.warning(
+                "Disabling --enable-mixed-chunk for %s speculative decoding; "
+                "decode-first may still disable mixed prefill+decode on "
+                "paged-KV setups for safety, while budgeting decode tokens first.",
+                cfg.speculative_algorithm,
+            )
+        else:
+            logger.warning(
+                "Mixed chunked prefill is disabled: %s speculative decoding does "
+                "not support it.",
+                cfg.speculative_algorithm,
+            )
 
     model_arch = model_config_of(server_args).hf_config.architectures[0]
     if model_arch in [
