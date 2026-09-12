@@ -13,9 +13,7 @@ gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
 import importlib.util
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,8 +21,6 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _FLASH_MLA_AVAILABLE = (
     importlib.util.find_spec("sgl_kernel") is not None
@@ -129,6 +125,47 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(128,),
             extend_lens=(16,),
             compress_ratio=128,
+        ),
+        # DeepSeek V4.1 ratio 1 / 2: latents in the c1 / c2 FlashMLA-layout pools,
+        # attended through the same extra-cache path as C4.
+        DSV4AttentionCase(
+            name="dsv4_c1_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            extend_lens=(16,),
+            compress_ratio=1,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c1_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 200),
+            compress_ratio=1,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            # Odd lengths: the ratio-2 causal count (pos + 1) // 2 rounds down.
+            prefix_lens=(33,),
+            extend_lens=(7,),
+            compress_ratio=2,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(65,),
+            compress_ratio=2,
         ),
         DSV4AttentionCase(
             name="dsv4_c128_decode",
@@ -344,7 +381,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 [[base + 11, base + 12], [base + 13, base + 14]], dtype=torch.int32
             ),
             swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
-            c4_sparse_topk=128,
+            index_topk=128,
         )
         metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
         metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
@@ -369,7 +406,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
-        metadata.c1_flashmla_metadata = object()
+        metadata.c0_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
         return metadata
@@ -395,6 +432,114 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             DeepseekV4AttnBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
 
+    def test_prefill_snapshot_declares_pre_replay_boundary(self):
+        from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        self.assertIs(
+            backend.shared_read_ends(ForwardMode.EXTEND),
+            SharedReadEnds.UNKNOWN,
+        )
+
+        backend.forward_metadata.prefill_shared_reads_snapshotted = True
+        self.assertIs(
+            backend.shared_read_ends(ForwardMode.EXTEND),
+            SharedReadEnds.PRE_REPLAY,
+        )
+
+    def test_snapshot_builds_cache_only_for_sparse_prefill(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _LARGE_INDEXER_QUERY_THRESHOLD,
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        cache = object()
+        for num_qo_tokens, builds in (
+            (_LARGE_INDEXER_QUERY_THRESHOLD, False),
+            (_LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+        ):
+            with self.subTest(num_qo_tokens=num_qo_tokens):
+                backend = object.__new__(DeepseekV4AttnBackend)
+                backend.model_runner = SimpleNamespace(
+                    spec_algorithm=SpeculativeAlgorithm.DFLASH
+                )
+                backend.forward_metadata = DSV4Metadata(
+                    self._make_core_metadata(0), indexer_metadata=None
+                )
+                backend._build_sparse_prefill_chunk_cache = mock.Mock(
+                    return_value=cache
+                )
+
+                with (
+                    envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
+                    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
+                    mock.patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                        return_value=SimpleNamespace(is_sm120=False),
+                    ),
+                ):
+                    backend.prepare_prefill_shared_read_snapshot(
+                        batch, num_qo_tokens=num_qo_tokens
+                    )
+
+                metadata = backend.forward_metadata
+                if builds:
+                    backend._build_sparse_prefill_chunk_cache.assert_called_once_with(
+                        batch, num_qo_tokens=num_qo_tokens
+                    )
+                    self.assertIs(metadata.sparse_prefill_cache, cache)
+                else:
+                    backend._build_sparse_prefill_chunk_cache.assert_not_called()
+                    self.assertIsNone(metadata.sparse_prefill_cache)
+                # Dense declares the boundary too; it reads only the metadata
+                # that init_forward_metadata already snapshotted.
+                self.assertTrue(metadata.prefill_shared_reads_snapshotted)
+
+    def test_sparse_prefill_snapshot_marks_success_only_after_build(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.model_runner = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DFLASH
+        )
+        backend.forward_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        backend.forward_metadata.prefill_shared_reads_snapshotted = True
+        backend._build_sparse_prefill_chunk_cache = mock.Mock(
+            side_effect=RuntimeError("snapshot failed")
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        with (
+            envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
+            mock.patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                return_value=SimpleNamespace(is_sm120=False),
+            ),
+            self.assertRaisesRegex(RuntimeError, "snapshot failed"),
+        ):
+            backend.prepare_prefill_shared_read_snapshot(batch, num_qo_tokens=12288)
+
+        self.assertFalse(backend.forward_metadata.prefill_shared_reads_snapshotted)
+
     def test_refresh_replay_metadata_preserves_captured_tensor_storage(self):
         capture_metadata = self._make_core_metadata(0)
         replay_metadata = self._make_core_metadata(1000)
@@ -415,7 +560,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
+            "c0_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
@@ -463,6 +608,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self._make_core_metadata(0), indexer_metadata=None
         )
         capture_metadata.sparse_prefill_cache = object()
+        capture_metadata.prefill_shared_reads_snapshotted = True
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
@@ -491,6 +637,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)
+        self.assertFalse(capture_metadata.prefill_shared_reads_snapshotted)
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,
@@ -519,12 +666,10 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         for max_seq_len in (3, 4, 255, 256, 259, 260):
             with self.subTest(max_seq_len=max_seq_len):
                 cache = self._make_sparse_prefill_cache(max_seq_len)
-                cache.ensure_c4(page_table, c4_page_size=64)
+                gather = cache.ensure_compressed(4, page_table, c_page_size=64)
                 expected_extent = max(max_seq_len // 4, 1)
-                self.assertEqual(cache.c4_flat_token_ids.numel(), 2 * expected_extent)
-                self.assertEqual(
-                    cache.c4_compressed_base.tolist(), [0, expected_extent]
-                )
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.compressed_base.tolist(), [0, expected_extent])
 
     def test_sparse_prefill_c128_uses_live_extent(self):
         from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
