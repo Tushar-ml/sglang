@@ -1390,6 +1390,24 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
+    # Fused single-pass hc_mix_stats: streams x once, no split-K, BLOCK_M=64.
+    # "off" = stock split-K path. "tf32x3" = same precision as stock, ~2.5x.
+    # "bf16" = ~8.6x, mix rel-err ~1.6e-3 (NOT batch-invariant).
+    SGLANG_OPT_FUSED_HC_MIX = EnvStr("off")
+    # Pre-transpose hc_fn to [K, MIX] so the mix-stats weight load is contiguous.
+    # Bitwise identical; 1.20x at M=640 (batch 128 x DSPARK block 5), neutral below.
+    SGLANG_OPT_HC_COALESCED_WEIGHT = EnvBool(False)
+    # FlashInfer mm_mxfp8 backend. "auto" re-runs backend selection on EVERY
+    # call and picks a slower kernel: measured 95.8us auto vs 78.0us cutlass
+    # (1.23x) at M=8192 K=5120 N=2304 on B200. Pinning removes both costs.
+    SGLANG_OPT_MXFP8_MM_BACKEND = EnvStr("auto")
+    # Hoist the per-request scalar reads in the torch indexer path into ONE
+    # device->host transfer. The stock loop calls .nonzero() and .max().item()
+    # per request per layer; nsys attributed 69.2ms across 106
+    # aten::_local_scalar_dense calls to this pattern (30.5% of host CUDA-API
+    # time was cudaStreamSynchronize). Requests are unique_CONSECUTIVE, so token
+    # spans are contiguous and .nonzero() is unnecessary.
+    SGLANG_OPT_BATCH_INDEXER_SCALARS = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)

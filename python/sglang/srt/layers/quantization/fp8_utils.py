@@ -537,6 +537,13 @@ if get_platform().is_blackwell and is_flashinfer_available():
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
     ) -> torch.Tensor:
+        # "auto" re-runs FlashInfer's backend selection on every call and, on
+        # B200, lands on a slower kernel than cutlass (95.8us vs 78.0us at
+        # M=8192 K=5120 N=2304). Pipeline analysis attributed 170.7ms of
+        # GPU-idle host time to this wrapper, so the per-call cost matters.
+        pinned = envs.SGLANG_OPT_MXFP8_MM_BACKEND.get()
+        if pinned != "auto" and backend == "auto":
+            backend = pinned
         return _raw_flashinfer_mm_mxfp8(
             q_input,
             weight_t,

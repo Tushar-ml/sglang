@@ -2091,6 +2091,110 @@ def _hc_mix_stats_partial_kernel(
 
 
 @triton.jit
+def _hc_mix_stats_partial_kt_kernel(
+    x_ptr,
+    wt_ptr,
+    part_mix_ptr,
+    part_sq_ptr,
+    M,
+    K,
+    x_stride_m,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """Same math as _hc_mix_stats_partial_kernel with wt pre-transposed to [K, MIX].
+
+    The strided kernel indexes hc_fn as [MIX, K], so n is the fast-varying index
+    of the loaded tile and consecutive lanes stride by K floats. Taking the
+    transpose once per weight makes that load contiguous. Tiles, K slicing and
+    accumulation order are unchanged, so results are bitwise identical.
+    """
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_m = offs_m < M
+    mask_n = offs_n < MIX
+    k_per_slice = K // NUM_SLICES
+    k_start = pid_s * k_per_slice
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for kb in range(0, k_per_slice, BLOCK_K):
+        offs_k = k_start + kb + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < k_start + k_per_slice
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        w_tile = tl.load(
+            wt_ptr + offs_k[:, None] * MIX + offs_n[None, :],
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
+        sq += tl.sum(x_tile * x_tile, axis=1)
+    tl.store(
+        part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+    tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
+
+
+# Below this M the strided and coalesced loads measure the same (the weight stays
+# resident in L2 across the few row-blocks); at M=640 -- batch 128 x DSPARK block
+# 5, the real decode shape -- the transpose is worth 1.20x. Measured on B200.
+_HC_KT_MIN_M = 512
+_hc_kt_cache: dict = {}
+
+
+def _hc_fn_transposed(hc_fn: torch.Tensor) -> torch.Tensor:
+    """[MIX, K] -> contiguous [K, MIX], cached per weight tensor.
+
+    Keyed on the storage pointer: hc_fn is a model parameter and never changes
+    after load, so one transpose per layer is amortised over every forward.
+    """
+    key = (hc_fn.data_ptr(), hc_fn.shape[0], hc_fn.shape[1])
+    wt = _hc_kt_cache.get(key)
+    if wt is None:
+        wt = hc_fn.t().contiguous()
+        _hc_kt_cache[key] = wt
+    return wt
+
+
+def _launch_hc_partial(
+    x_flat, hc_fn, part_mix, part_sq, m, k, mix, mix_pad, num_slices, block_m
+):
+    """Dispatch to the coalesced-weight kernel when M is large enough to pay for it."""
+    grid = (triton.cdiv(m, block_m), num_slices)
+    common = dict(
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        NUM_SLICES=num_slices,
+        BLOCK_M=block_m,
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+        num_warps=_HC_MIX_NUM_WARPS,
+        num_stages=_num_stages_for(m, k),
+    )
+    if m >= _HC_KT_MIN_M and envs.SGLANG_OPT_HC_COALESCED_WEIGHT.get():
+        _hc_mix_stats_partial_kt_kernel[grid](
+            x_flat, _hc_fn_transposed(hc_fn), part_mix, part_sq,
+            m, k, x_flat.stride(0), **common,
+        )
+    else:
+        _hc_mix_stats_partial_kernel[grid](
+            x_flat, hc_fn, part_mix, part_sq,
+            m, k, x_flat.stride(0), hc_fn.stride(0), **common,
+        )
+
+
+@triton.jit
 def _hc_mix_stats_reduce_kernel(
     part_mix_ptr,
     part_sq_ptr,
@@ -2195,23 +2299,8 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         return mixes
     block_m = _block_m_for(m)
     grid_m = triton.cdiv(m, block_m)
-    _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
-        x_flat,
-        hc_fn,
-        part_mix,
-        part_sq,
-        m,
-        k,
-        x_flat.stride(0),
-        hc_fn.stride(0),
-        MIX=mix,
-        MIX_PAD=mix_pad,
-        NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
-        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+    _launch_hc_partial(
+        x_flat, hc_fn, part_mix, part_sq, m, k, mix, mix_pad, num_slices, block_m
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2288,6 +2377,101 @@ def _hc_mix_reduce_sinkhorn_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
+# ---------------------------------------------------------------------------
+# Fused single-pass hc_mix_stats (opt-in via SGLANG_OPT_FUSED_HC_MIX).
+#
+# The stock path runs a split-K partial kernel (BLOCK_M<=32, MIX_PAD=32,
+# tf32x3) over ~20,480 CTAs, then a separate reduce. Profiling DSV4.1 at TP4
+# showed it at 23% of GPU time -- the single largest kernel -- and ~13.7x off
+# the HBM read floor for its own operands.
+#
+# This version streams x exactly once: BLOCK_M=64 (vs <=32) quarters the weight
+# re-reads, split-K is gone along with its partial buffers, and the sum of
+# squares is fused into the same pass.
+#
+# Measured on B200, M=8192 K=20480 MIX=24, vs 856.8us stock:
+#   tf32x3 -> 364us (2.36x), end-to-end rel-err ~3e-5   <- use this
+#   bf16   -> 118us (7.3x)  but DISQUALIFIED: sinkhorn amplifies the 1.6e-3 mix
+#             error to 9-26% on pre/post/comb. tf32x3 is not merely a batch-
+#             invariance choice -- the sinkhorn iteration is genuinely
+#             ill-conditioned and needs the precision.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _hc_mix_stats_fused_kernel(
+    x_ptr, w_ptr, mix_ptr, sq_ptr,
+    M, K, x_stride_m, w_stride_n, mix_stride_m,
+    MIX: tl.constexpr, MIX_PAD: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT: tl.constexpr, PREC: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_m = offs_m < M
+    mask_n = offs_n < MIX
+    k_per = K // SPLIT
+    k_base = pid_s * k_per
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for kb in range(0, k_per, BLOCK_K):
+        offs_k = k_base + kb + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < k_base + k_per
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
+            mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
+            mask=mask_n[None, :] & mask_k[:, None], other=0.0,
+        )
+        xf = x_tile.to(tl.float32)
+        if PREC == "bf16":
+            acc += tl.dot(x_tile, w_tile.to(x_tile.dtype), out_dtype=tl.float32)
+        else:
+            acc += tl.dot(xf, w_tile.to(tl.float32), input_precision=PREC,
+                          out_dtype=tl.float32)
+        sq += tl.sum(xf * xf, axis=1)
+    tl.store(mix_ptr + pid_s * M * MIX + offs_m[:, None] * mix_stride_m + offs_n[None, :],
+             acc, mask=mask_m[:, None] & mask_n[None, :])
+    tl.store(sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
+
+
+# Autotuned on B200 at M=8192,K=20480,MIX=24 over BM{32,64} x BK{64,128} x
+# SPLIT{1,2,4,8}: BM64/BK64/SPLIT2 = 289us (best), vs 364us at SPLIT=1 and 858us
+# stock. SPLIT=1 leaves only M/64=128 CTAs on 148 SMs -- occupancy-bound, not
+# bandwidth-bound. SPLIT=2 doubles CTAs and also lowers error (4.3e-7 vs 7.1e-7).
+_FUSED_HC_BLOCK_M = 64
+_FUSED_HC_BLOCK_K = 64
+_FUSED_HC_SPLIT = 2
+# The fused kernel runs one CTA per 64 rows and every CTA walks the whole K, so
+# its cost is flat (~363us) until grid exceeds the SM count (M ~ 64*148 = 9472).
+# Stock scales with M and is cheaper below the crossover, measured at M~3500.
+_FUSED_HC_MIN_TOKENS = 4096
+
+
+def _fused_hc_mix_stats(x_flat, hc_fn, mode):
+    """One-pass mix stats. Returns (part_mix [1,M,MIX], part_sq [1,M]) so the
+    stock reduce+sinkhorn kernel can consume it unchanged with NUM_SLICES=1."""
+    m, k = x_flat.shape
+    mix = hc_fn.shape[0]
+    dev = x_flat.device
+    split = _FUSED_HC_SPLIT if (k % (_FUSED_HC_SPLIT * _FUSED_HC_BLOCK_K) == 0) else 1
+    part_mix = torch.empty((split, m, mix), dtype=torch.float32, device=dev)
+    part_sq = torch.empty((split, m), dtype=torch.float32, device=dev)
+    w = hc_fn.to(torch.bfloat16).contiguous() if mode == "bf16" else hc_fn
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    _hc_mix_stats_fused_kernel[(triton.cdiv(m, _FUSED_HC_BLOCK_M), split)](
+        x_flat, w, part_mix, part_sq,
+        m, k, x_flat.stride(0), w.stride(0), mix,
+        MIX=mix, MIX_PAD=mix_pad,
+        BLOCK_M=_FUSED_HC_BLOCK_M, BLOCK_K=_FUSED_HC_BLOCK_K,
+        SPLIT=split, PREC=mode,
+        num_warps=8, num_stages=3,
+    )
+    return part_mix, part_sq
+
+
 def hc_mix_stats_sinkhorn(
     x_flat: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2316,28 +2500,26 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
+    _fused_mode = envs.SGLANG_OPT_FUSED_HC_MIX.get()
+    if _fused_mode != "off" and m >= _FUSED_HC_MIN_TOKENS:
+        part_mix, part_sq = _fused_hc_mix_stats(x_flat, hc_fn, _fused_mode)
+        num_slices = part_mix.shape[0]
+        _hc_mix_reduce_sinkhorn_kernel[(m,)](
+            part_mix, part_sq,
+            hc_scale.float().contiguous(), hc_base.float().contiguous(),
+            pre, post, comb, m, 1.0 / k, rms_eps,
+            MIX=mix, HC=hc_mult, NUM_SLICES=num_slices,
+            ITERS=sinkhorn_iters, EPS=hc_eps, num_warps=1,
+        )
+        return pre, post, comb
+
     num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
-    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
-        x_flat,
-        hc_fn,
-        part_mix,
-        part_sq,
-        m,
-        k,
-        x_flat.stride(0),
-        hc_fn.stride(0),
-        MIX=mix,
-        MIX_PAD=mix_pad,
-        NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
-        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+    _launch_hc_partial(
+        x_flat, hc_fn, part_mix, part_sq, m, k, mix, mix_pad, num_slices, block_m
     )
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,

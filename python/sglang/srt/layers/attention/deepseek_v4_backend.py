@@ -3549,10 +3549,36 @@ class DeepseekV4AttnBackend(
         topk = indexer.index_topk
         publish = [] if indexer.is_candidate_source else None
         consume = self.candidate_masks if indexer.uses_candidates else None
-        for b, r in enumerate(torch.unique_consecutive(req).tolist()):
-            tok = (req == r).nonzero().squeeze(1)
-            lens = compress_lens[tok]
-            lc = int(lens.max().item())
+        # Stock path syncs twice per request (.nonzero(), .max().item()) on top of
+        # the .tolist(). Batched path computes every per-request scalar on device
+        # and does ONE device->host transfer for the whole loop; token spans are
+        # contiguous because req is unique_CONSECUTIVE, so .nonzero() is not needed.
+        if envs.SGLANG_OPT_BATCH_INDEXER_SCALARS.get():
+            _uniq, _counts = torch.unique_consecutive(req, return_counts=True)
+            _seg = torch.repeat_interleave(
+                torch.arange(_uniq.numel(), device=req.device), _counts
+            )
+            _lc = torch.zeros(
+                _uniq.numel(), dtype=compress_lens.dtype, device=compress_lens.device
+            ).scatter_reduce_(0, _seg, compress_lens, reduce="amax", include_self=False)
+            _starts = torch.cumsum(_counts, 0) - _counts
+            # single sync for the entire loop
+            _plan = torch.stack(
+                [_uniq, _counts, _starts, _lc.to(_uniq.dtype)]
+            ).tolist()
+            _iter = list(zip(*_plan))
+        else:
+            _iter = [(r, None, None, None) for r in torch.unique_consecutive(req).tolist()]
+
+        for b, (r, _cnt, _start, _lcv) in enumerate(_iter):
+            if _cnt is None:
+                tok = (req == r).nonzero().squeeze(1)
+                lens = compress_lens[tok]
+                lc = int(lens.max().item())
+            else:
+                tok = torch.arange(_start, _start + _cnt, device=req.device)
+                lens = compress_lens[tok]
+                lc = int(_lcv)
             if lc == 0:
                 # Consumers address masks by request position, including empty requests.
                 if publish is not None:
