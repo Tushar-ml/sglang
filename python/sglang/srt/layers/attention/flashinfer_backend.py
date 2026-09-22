@@ -311,6 +311,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
             model_runner
         )
@@ -364,13 +365,27 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         # Parse constants
-        self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=self.flashinfer_kv_cache_dtype,
-            num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_parallel().attn_tp_size,
-            num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
+        self._full_num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        self._num_attention_heads = (
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+        )
+        # SWA layers may use a different num_kv_heads (e.g. Gemma4).
+        self.swa_num_kv_heads = model_runner.model_config.get_swa_num_kv_heads(
+            get_parallel().attn_tp_size
+        )
+        # True when SWA and full-attention layers have different kv head counts.
+        self.has_heterogeneous_kv_heads = (
+            self.swa_num_kv_heads != self._full_num_kv_heads
+            and model_runner.sliding_window_size is not None
+        )
+        # SWA layers may also use a different head_dim (e.g. Gemma4: 256 vs 512).
+        self.swa_head_dim = model_runner.model_config.swa_head_dim
+        self.head_dim = model_runner.model_config.head_dim
+        self.has_heterogeneous_head_dims = (
+            model_runner.sliding_window_size is not None
+            and self.swa_head_dim != self.head_dim
         )
         self.max_context_len = model_runner.model_config.context_len
         self.page_size = model_runner.page_size
@@ -391,17 +406,33 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
+        self.decode_use_tensor_cores = [
+            self._decode_use_tensor_cores_for_wrapper(i)
+            for i in range(self.num_wrappers)
+        ]
+
+        _architectures = model_runner.model_config.hf_config.architectures
+        _is_gemma4 = any(
+            name in _architectures
+            for name in (
+                "Gemma4ForConditionalGeneration",
+                "Gemma4UnifiedForConditionalGeneration",
+                "Gemma4TextModel",
+            )
+        )
+        # Qwen2/Qwen3 and Gemma-4 hybrid models require higher flashinfer workspace.
         if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLMoeForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
+            "Qwen2ForCausalLM" in _architectures
+            or "Qwen3ForCausalLM" in _architectures
+            or "MiMoForCausalLM" in _architectures
+            or "Qwen3VLForConditionalGeneration" in _architectures
+            or "Qwen3VLMoeForConditionalGeneration" in _architectures
+            or _is_gemma4
         ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
+            workspace_size = 512 * 1024 * 1024
+            if _is_gemma4 and self.has_heterogeneous_head_dims:
+                workspace_size = 1024 * 1024 * 1024
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(workspace_size)
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -412,8 +443,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_split_tile_size = None
         self.decode_split_tile_size = None
         self.disable_cuda_graph_kv_split = False
+        _decode_split_env = os.environ.get("SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE")
+        if _decode_split_env is not None:
+            self.decode_split_tile_size = int(_decode_split_env)
         if self.enable_deterministic:
-            self.decode_use_tensor_cores = True
+            self.decode_use_tensor_cores = [True] * self.num_wrappers
             self.prefill_split_tile_size = get_int_env_var(
                 "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
             )
@@ -493,16 +527,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+        num_ragged_wrappers = (
+            self.num_wrappers if self.has_heterogeneous_head_dims else 1
         )
+        self.prefill_wrappers_ragged = [
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=fmha_backend
+            )
+            for _ in range(num_ragged_wrappers)
+        ]
+        # Backward-compatible alias (single-ragged models only).
+        self.prefill_wrapper_ragged = self.prefill_wrappers_ragged[0]
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
-        for _ in range(self.num_wrappers):
+        for wrapper_idx in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
@@ -523,7 +565,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
+                    use_tensor_cores=self.decode_use_tensor_cores[wrapper_idx],
                 )
             )
 
@@ -556,6 +598,15 @@ class FlashInferAttnBackend(AttentionBackend):
             f"KV cache method {method_name!r} does not support {phase} with "
             f"flashinfer attention backend. Available {phase} accesses: {available}."
         )
+
+        # FlashInfer uses custom CUDA kernels and dynamic metadata (paged KV
+        # indices, SWA slot mappings). torch.compile must not trace through
+        # attention forward — same rationale as triton_backend's
+        # torch.compiler.disable on decode/extend kernels. Without this,
+        # hybrid SWA models can write KV at full-pool indices while the SWA
+        # pool expects translated slots, corrupting full_to_swa_index_mapping
+        # and crashing during eviction under load.
+        self.forward = torch.compiler.disable(self.forward)
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
@@ -746,7 +797,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
-                fixed_split_size=None,
+                fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
                 req_pool_indices=req_pool_indices,
             )
@@ -1010,6 +1061,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     not self.enable_deterministic
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
+                    and not self.has_heterogeneous_kv_heads
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
@@ -1096,7 +1148,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 "NHD",
                 backend=self.decode_backend,
                 use_cuda_graph=True,
-                use_tensor_cores=self.decode_use_tensor_cores,
+                use_tensor_cores=self.decode_use_tensor_cores[i],
                 paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
                 paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
                 paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
@@ -1120,6 +1172,24 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             wrappers = self.decode_cuda_graph_metadata[bs]
         return wrappers
+
+    def _decode_use_tensor_cores_for_wrapper(self, wrapper_idx: int) -> bool:
+        """Per-wrapper tensor-core policy for heterogeneous Gemma-4 decode."""
+        if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW and wrapper_idx == 0:
+            num_kv_heads = self.swa_num_kv_heads
+            if self.has_heterogeneous_head_dims:
+                swa_env = os.environ.get("SGLANG_FLASHINFER_SWA_USE_TENSOR_CORE")
+                if swa_env is not None:
+                    return swa_env.lower() == "true"
+                # SWA hd256: native batch_decode is typically faster than TC path.
+                return False
+        else:
+            num_kv_heads = self._full_num_kv_heads
+        return should_use_tensor_core(
+            kv_cache_dtype=self.kv_cache_dtype,
+            num_attention_heads=self._num_attention_heads,
+            num_kv_heads=num_kv_heads,
+        )
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
@@ -1316,6 +1386,9 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        prefill_wrapper_ragged = self._ragged_prefill_wrapper(
+            self._get_wrapper_idx(layer)
+        )
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -1412,7 +1485,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1430,7 +1503,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1511,6 +1584,9 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         # Call the wrapped function
+        q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if not q_view.is_contiguous():
+            q_view = q_view.contiguous()
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             kv_cache,
@@ -1534,6 +1610,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
+    def _ragged_prefill_wrapper(self, wrapper_idx: int):
+        if self.has_heterogeneous_head_dims:
+            return self.prefill_wrappers_ragged[wrapper_idx]
+        return self.prefill_wrappers_ragged[0]
+
 
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
@@ -1548,8 +1629,13 @@ class FlashInferIndicesUpdaterDecode:
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
+        # For models with different kv_heads on SWA vs full-attention layers (e.g. Gemma4).
+        self.swa_num_kv_heads = attn_backend.swa_num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
+        self.swa_head_dim = attn_backend.swa_head_dim
+        self.has_heterogeneous_head_dims = attn_backend.has_heterogeneous_head_dims
+        self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1639,15 +1725,23 @@ class FlashInferIndicesUpdaterDecode:
                 else:
                     paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
                 kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
+                wrapper_num_kv_heads = self.swa_num_kv_heads
             else:
                 # Full attention
                 paged_kernel_lens_tmp = seq_lens
                 paged_kernel_lens_sum_tmp = seq_lens_sum
                 seq_lens_cpu_tmp = seq_lens_cpu
                 kv_start_idx_tmp = None
+                wrapper_num_kv_heads = self.num_kv_heads
 
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
+            )
+
+            wrapper_head_dim = (
+                self.swa_head_dim
+                if wrapper_id == 0 and self.has_heterogeneous_head_dims
+                else self.head_dim
             )
 
             self.call_begin_forward(
@@ -1662,6 +1756,8 @@ class FlashInferIndicesUpdaterDecode:
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
                 req_pool_indices=req_pool_indices,
+                num_kv_heads=wrapper_num_kv_heads,
+                head_dim=wrapper_head_dim,
             )
 
     def update_cross_attention(
@@ -1718,12 +1814,20 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         *,
         req_pool_indices: torch.Tensor,
+        num_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
     ):
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side kernel-facing ids, so the in-place
         # full->swa translate below must not run on top of them.
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
+        # Allow per-wrapper kv head count override for models with heterogeneous kv heads
+        # (e.g. Gemma4 where SWA and full-attention layers differ).
+        effective_num_kv_heads = (
+            num_kv_heads if num_kv_heads is not None else self.num_kv_heads
+        )
+        effective_head_dim = head_dim if head_dim is not None else self.head_dim
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(paged_kernel_lens)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1774,6 +1878,11 @@ class FlashInferIndicesUpdaterDecode:
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
+        # fixed_split_size is only valid for tensor-core decode wrappers.
+        effective_fixed_split_size = (
+            fixed_split_size if wrapper.use_tensor_cores else None
+        )
+
         if wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             wrapper.begin_forward(
@@ -1781,13 +1890,13 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.kv_last_page_len[:bs],
                 self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                effective_num_kv_heads,
+                effective_head_dim,
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
-                fixed_split_size=fixed_split_size,
+                fixed_split_size=effective_fixed_split_size,
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
@@ -1800,13 +1909,13 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.kv_last_page_len[:bs],
                 self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                effective_num_kv_heads,
+                effective_head_dim,
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
-                fixed_split_size=fixed_split_size,
+                fixed_split_size=effective_fixed_split_size,
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
@@ -1829,8 +1938,13 @@ class FlashInferIndicesUpdaterPrefill:
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
+        # For models with different kv_heads on SWA vs full-attention layers (e.g. Gemma4).
+        self.swa_num_kv_heads = attn_backend.swa_num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
+        self.swa_head_dim = attn_backend.swa_head_dim
+        self.has_heterogeneous_head_dims = attn_backend.has_heterogeneous_head_dims
+        self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1843,7 +1957,7 @@ class FlashInferIndicesUpdaterPrefill:
         # normal builders source from the per-batch KVIndexTable.
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1904,7 +2018,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            self.prefill_wrappers_ragged[0],
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -1992,17 +2106,29 @@ class FlashInferIndicesUpdaterPrefill:
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+                wrapper_num_kv_heads = self.swa_num_kv_heads
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
                 kv_start_idx = seq_lens - paged_kernel_lens
+                wrapper_num_kv_heads = self.num_kv_heads
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
             )
+            wrapper_head_dim = (
+                self.swa_head_dim
+                if wrapper_id == 0 and self.has_heterogeneous_head_dims
+                else self.head_dim
+            )
+            ragged_wrapper = (
+                self.prefill_wrappers_ragged[wrapper_id]
+                if self.has_heterogeneous_head_dims
+                else self.prefill_wrappers_ragged[0]
+            )
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                ragged_wrapper,
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2025,6 +2151,8 @@ class FlashInferIndicesUpdaterPrefill:
                     if (wrapper_id == 0 and not use_ragged and spec_info is None)
                     else -1
                 ),
+                num_kv_heads=wrapper_num_kv_heads,
+                head_dim=wrapper_head_dim,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -2102,7 +2230,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[0],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2142,7 +2270,15 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        num_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
     ):
+        # Allow per-wrapper kv head count override for models with heterogeneous kv heads
+        # (e.g. Gemma4 where SWA and full-attention layers differ).
+        effective_num_kv_heads = (
+            num_kv_heads if num_kv_heads is not None else self.num_kv_heads
+        )
+        effective_head_dim = head_dim if head_dim is not None else self.head_dim
         bs = len(seq_lens)
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side kernel-facing ids, so the in-place
@@ -2215,8 +2351,8 @@ class FlashInferIndicesUpdaterPrefill:
                 qo_indptr,
                 qo_indptr,
                 self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                effective_num_kv_heads,
+                effective_head_dim,
                 q_data_type=self.q_data_type,
             )
 
@@ -2295,8 +2431,8 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
+            effective_num_kv_heads,
+            effective_head_dim,
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
