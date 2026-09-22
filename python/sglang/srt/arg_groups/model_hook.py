@@ -596,12 +596,13 @@ def handle_model_specific_adjustments(server_args: Any):
             "intel_amx",
             "aiter",
             "flashinfer",
+            "fa4",
         )
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
             "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, "
-            "aiter, or flashinfer attention backend, got "
+            "aiter, flashinfer, or fa4 attention backend, got "
             f"prefill={prefill_backend}, decode={decode_backend}"
         )
 
