@@ -792,6 +792,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
                             break
+                elif any(
+                    kwargs.get(name) is not None
+                    for name in ("input_embeds", "inputs_embeds")
+                ):
+                    # Supplying both contradicts the framework contract:
+                    # general_mm_embed_routine calls the language model with
+                    # input_ids=None whenever it passes composed embeddings, and
+                    # the captured body reads its activations from the static
+                    # input_embeds slot either way (see replay_layer_forward).
+                    # Permissive bodies silently ignore the input_ids they were
+                    # handed; one that enforces the exclusive-or (Gemma-4)
+                    # rejects the capture outright.
+                    input_ids = None
                 return self.layer_model.forward(
                     input_ids,
                     positions,
