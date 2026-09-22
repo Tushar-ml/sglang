@@ -379,6 +379,11 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
+        # Gemma4Unified is deliberately absent: it is encoder-free and skips
+        # Gemma4ForConditionalGeneration.__init__, so it carries embedders
+        # (vision_embedder / embed_vision / embed_audio) rather than towers
+        # and needs its own gate.
     )
 
     # The attention-backend allow-list is enforced via
