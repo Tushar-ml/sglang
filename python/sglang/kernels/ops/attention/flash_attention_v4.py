@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 from typing import Callable, Optional, Tuple, Union
 
@@ -26,6 +27,21 @@ else:
 
 def is_flash_attention_v4_available() -> bool:
     return _flash_attn_varlen_func is not None
+
+
+@functools.lru_cache(maxsize=1)
+def _needs_dense_hd256_strides() -> bool:
+    """Whether the hd256 path requires dense Q/K/V strides.
+
+    Only the vendored SM100 2-CTA hd256 kernel makes that assumption. The
+    generic SM90 kernel handles strided inputs: feeding it a q that is a
+    strided slice of a fused qkv buffer returns bit-identical results to the
+    contiguous copy, so forcing .contiguous() there is a pure waste (~1 GB per
+    layer at 32K on Gemma-4's 50 sliding-window layers).
+    """
+    if not torch.cuda.is_available():
+        return True
+    return torch.cuda.get_device_capability()[0] != 9
 
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -136,7 +152,13 @@ def flash_attn_varlen_func(
         ) from _flash_attn_import_error
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
-    if qv is None and q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256:
+    if (
+        qv is None
+        and q.shape[-1] == 256
+        and k.shape[-1] == 256
+        and v.shape[-1] == 256
+        and _needs_dense_hd256_strides()
+    ):
         # The vendored hd256 kernel assumes dense Q/K/V strides.
         # TODO: Remove this workaround after the FA4 in current environment includes
         # https://github.com/Dao-AILab/flash-attention/pull/2670 (flash-attn-4 >= 4.0.0b20).

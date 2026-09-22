@@ -53,6 +53,29 @@ class HybridAttnBackend(AttentionBackend):
         )
 
     @property
+    def token_to_kv_pool(self):
+        return self._token_to_kv_pool
+
+    @token_to_kv_pool.setter
+    def token_to_kv_pool(self, pool) -> None:
+        """Propagate a pool swap to the sub-backends.
+
+        `forward()` delegates to `prefill_backend` / `decode_backend`, so the
+        `self.token_to_kv_pool` that `forward_extend` / `forward_decode` read is
+        the *sub-backend's* attribute, not this wrapper's. Frozen-KV MTP swaps
+        this attribute to point a draft worker at the target's frozen pool
+        (`frozen_kv_mtp_utils.target_kv_pool_view`, whose docstring assumes
+        "self is draft_attn_backend" -- true for a plain backend, false here).
+        Without propagation the draft keeps reading its own small pool while its
+        layers carry target physical layer ids, which indexes past the end of
+        that pool's k_buffer.
+        """
+        self._token_to_kv_pool = pool
+        for backend in (self.prefill_backend, self.decode_backend):
+            if backend is not None:
+                backend.token_to_kv_pool = pool
+
+    @property
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
         backend = (

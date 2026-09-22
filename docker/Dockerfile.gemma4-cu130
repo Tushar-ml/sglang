@@ -1,0 +1,59 @@
+# Self-contained CUDA 13 env for validating the Gemma-4 FlashInfer port against
+# sglang main's real pins. Runs on a CUDA 12.8 host driver via cuda-compat
+# forward compatibility (datacenter GPUs, driver >= 525).
+FROM nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04
+
+# Prefer the forward-compat libcuda so CUDA 13 works on the 570 host driver.
+ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-dev python3.12-venv python3-pip git curl libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Isolated venv: avoids Debian's externally-managed pip.
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH VIRTUAL_ENV=/opt/venv
+RUN pip install -U pip setuptools wheel
+
+# Install ONLY sglang's [project].dependencies from main's pyproject. We do not
+# install the sglang package itself: its setup.py declares Rust extensions that
+# would need a cargo toolchain, and the live tree is mounted via PYTHONPATH anyway.
+COPY python/pyproject.toml /tmp/pyproject.toml
+RUN python - <<'PY' > /tmp/reqs.txt
+import tomllib
+with open("/tmp/pyproject.toml","rb") as f:
+    cfg = tomllib.load(f)
+for dep in cfg["project"]["dependencies"]:
+    print(dep)
+PY
+RUN cat /tmp/reqs.txt && pip install -r /tmp/reqs.txt
+
+# DeepGEMM JIT-compiles FP8 GEMM kernels at runtime and needs nvcc + CUDA headers,
+# which the -runtime base image omits. Added as a trailing layer so the expensive
+# dependency-install layer above stays cached.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/local/cuda/bin/nvcc --version | tail -2
+
+RUN python -c "import torch, transformers, sgl_kernel, flashinfer; print('BUILT torch', torch.__version__, '| tf', transformers.__version__, '| fi', flashinfer.__version__, '| sgl_kernel ok')"
+
+ENV HF_HUB_OFFLINE=1
+WORKDIR /work/sglang
+
+# ---------------------------------------------------------------------------
+# Usage (H100, CUDA 12.8 host driver -- works via cuda-compat forward compat):
+#
+#   docker build -f docker/Dockerfile.gemma4-cu130 -t sglang-gemma4-cu130 .
+#
+#   docker run --rm --gpus all --ipc=host --shm-size 16g \
+#     -v $PWD:/work/sglang \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     -e PYTHONPATH=/work/sglang/python \
+#     sglang-gemma4-cu130 \
+#     python -m sglang.bench_one_batch \
+#       --model-path RedHatAI/gemma-4-31B-it-FP8-dynamic \
+#       --batch-size 1 --input-len 32768 --attention-backend flashinfer \
+#       --chunked-prefill-size 32768 --disable-cuda-graph
+# ---------------------------------------------------------------------------

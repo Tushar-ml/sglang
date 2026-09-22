@@ -93,7 +93,10 @@ class PagedKVManager(ParamsBase):
             atom_async_copy, thr_layout, val_layout
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        # Ceiling division: with head_dim 512 the smem budget forces tile_n=64 while
+        # 2 MMA warpgroups give num_threads=384, so floor division yielded 0 entries
+        # per thread and a zero-sized rmem tensor.
+        page_entry_per_thread = (n_block_size + num_threads - 1) // num_threads
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(

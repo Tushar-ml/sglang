@@ -118,13 +118,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
     def _get_tiled_mma(self):
+        # Hopper wgmma caps the N-mode at 256, so head_dim > 256 (e.g. Gemma-4's
+        # 512-wide global-attention layers) must be covered by 2 MMA atoms along N.
+        atom_layout_n = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),
+            atom_layout_mnk=(self.tile_m // 64, atom_layout_n, 1),
             tiler_mn=(64, self.tile_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
@@ -135,10 +138,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             Float32,
             atom_layout_mnk=(
                 self.tile_m // 64,
+                atom_layout_n,
                 1,
-                1,
-            ),  # Might need (1, 2, 1) for hdim 512
-            tiler_mn=(64, self.tile_hdimv),
+            ),
+            tiler_mn=(64, min(256, self.tile_hdimv)),
             a_source=(
                 warpgroup.OperandSource.RMEM
                 if self.mma_pv_is_rs

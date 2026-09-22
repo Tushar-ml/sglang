@@ -195,9 +195,19 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         prefix = add_prefix("model", prefix)
 
+        # Set by ModelConfig from --language-model-only, or declared by a
+        # text-only checkpoint. Either way the towers are never built and
+        # their weights are never loaded, so that memory goes to the KV pool.
+        self.language_model_only = bool(getattr(config, "language_model_only", False))
+
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        if self.language_model_only:
+            self.vision_tower = None
+            self.embed_vision = None
+            self.audio_tower = None
+            self.embed_audio = None
+        elif self.pp_group.is_first_rank:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -417,7 +427,22 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
             get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
 
+    def _require_tower(self, kind: str) -> None:
+        """Multimodal input reached a text-only model.
+
+        The tokenizer layer already rejects media when language_model_only is
+        set, so this is a guard against a new code path smuggling an item
+        through -- it beats an AttributeError on a None tower.
+        """
+        if self.language_model_only:
+            raise RuntimeError(
+                f"{kind} input is not supported: this model was loaded with "
+                "--language-model-only (or a text-only checkpoint), so the "
+                f"{kind} tower was never built."
+            )
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_tower("image")
         vt = self.vision_tower
 
         all_embeds = []
@@ -481,6 +506,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         the batch dimension so each frame is encoded independently, then pooled
         dynamically based on the input patch count and pooling_kernel_size.
         """
+        self._require_tower("video")
         vt = self.vision_tower
 
         all_embeds = []
@@ -537,6 +563,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_tower("audio")
         if self.audio_tower is None:
             raise ValueError(
                 "Audio inputs provided but the model does not have an audio tower."
@@ -882,6 +909,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         for name, loaded_weight in weights:
             if "embed_vision.embedding." in name or "embed_audio.embedding." in name:
+                continue
+            if self.language_model_only and any(
+                p in name
+                for p in (
+                    "vision_tower.",
+                    "embed_vision.",
+                    "audio_tower.",
+                    "embed_audio.",
+                )
+            ):
+                # The towers were never built, so there is no parameter to fill
+                # and nothing should reach the device.
                 continue
             if self.audio_tower is None and (
                 "audio_tower." in name or "embed_audio." in name

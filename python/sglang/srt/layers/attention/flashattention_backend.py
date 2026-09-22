@@ -1516,7 +1516,7 @@ class FlashAttentionBackend(AttentionBackend):
                         **kwargs,
                     )
 
-                q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_cp = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
                 cp_strategy = get_cp_strategy()
                 assert cp_strategy is not None
                 result = cp_strategy.run_attention(
@@ -1566,7 +1566,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
                 result = flash_attn_varlen_func(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
                     cu_seqlens_q=metadata.fa_skip_cu_seqlens_q,
@@ -1583,7 +1583,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
@@ -1617,7 +1617,7 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 suffix_metadata = self.forward_metadata_spec_decode_expand
                 o = merge_suffix_attention_in_place(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
                     suffix_page_table=suffix_metadata.page_table,
@@ -1628,7 +1628,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     # The suffix table stores physical token slots, so expose
                     # the paged cache as page-size-one blocks.
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
@@ -1748,7 +1748,7 @@ class FlashAttentionBackend(AttentionBackend):
                         -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
                     )
                 else:
-                    q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                    q_all = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
@@ -1995,7 +1995,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
                 o = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=metadata.encoder_page_table,
@@ -2016,7 +2016,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
                 o = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=local_attn_metadata.local_block_table,
@@ -2053,9 +2053,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size = (-1, -1)
                     pa_swa_active = True
 
-                q_reshaped = q.contiguous().view(
-                    -1, layer.tp_q_head_num, layer.head_dim
-                )
+                q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
                 # Default: single-token self-attention
                 # Use precomputed scheduler_metadata when available and applicable.
@@ -2150,7 +2148,7 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
                 )
             else:
-                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_all = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q

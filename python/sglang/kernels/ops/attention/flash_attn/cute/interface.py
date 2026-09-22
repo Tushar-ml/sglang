@@ -118,7 +118,11 @@ def _validate_head_dims(
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    # head_dim == head_dim_v == 512 is reachable on SM90 via 2 wgmma atoms along N
+    # (see flash_fwd_sm90._get_tiled_mma); Gemma-4 global layers use this shape.
+    is_sm90_range = (8 <= head_dim <= 256 and 8 <= head_dim_v <= 256) or (
+        head_dim == head_dim_v == 512
+    )
     if compute_capability == 9:
         assert (
             is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0
@@ -200,9 +204,12 @@ def _tile_size_fwd_sm90(
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # hdim 512 (e.g. Gemma-4 global layers): wgmma N<=256 forces 2 MMA
+        # atoms along N, so tile_m must stay at 64 to keep num_wg_mma in [1,2,3].
+        return FwdConfig(64, 64, False, True)
 
 
 def maybe_contiguous(x):
@@ -1412,8 +1419,9 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                # hdim 512 needs tile_n*512*2B per K and V stage; 2 stages exceed
+                # sm_90a's 232 KB smem budget, so fall back to a single stage.
+                num_stages=1 if max(head_dim, head_dim_v) > 256 else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,

@@ -2296,6 +2296,8 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
     "Cohere2VisionForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "Glm5NextForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
